@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+.env
+*.json        # SA keys – don’t use them, but ignore just in case
+.ipynb_checkpoints/
+.DS_Store

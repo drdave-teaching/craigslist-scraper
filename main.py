@@ -170,6 +170,11 @@ def gcs_upload_text(bucket: str, path: str, text: str, content_type: str = "text
     blob.upload_from_string(text, content_type=content_type)
     return f"gs://{bucket}/{path}"
 
+def gcs_blob_exists(bucket: str, path: str) -> bool:
+    b = storage_client().bucket(bucket)
+    return b.blob(path).exists()
+
+
 # ------------- Core scrape -------------
 def scrape(max_pages: int) -> pd.DataFrame:
     all_rows = []
@@ -274,8 +279,13 @@ def scrape_http(request: Request):
         text = "\n".join(lines)
 
         obj_name = str(txt_prefix / save_listing_txt(row.to_dict(), detail))
+        if gcs_blob_exists(GCS_BUCKET, obj_name):
+            skipped += 1
+            continue
+        
         gcs_upload_text(GCS_BUCKET, obj_name, text, content_type="text/plain")
         saved += 1
+
         time.sleep(DETAIL_REQUEST_DELAY_SECS)
 
     result = {

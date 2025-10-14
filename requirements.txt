@@ -1,1 +1,7 @@
 # to be updated
+functions-framework==3.*
+google-cloud-storage>=2.16.0
+beautifulsoup4>=4.12.2
+lxml>=5.2.1
+pandas>=2.1.0
+requests>=2.31.0

@@ -1,0 +1,113 @@
+name: Deploy — Craigslist Scraper (Cloud Functions Gen2)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'main.py'
+      - 'requirements.txt'
+      - '.github/workflows/deploy.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write   # needed for OIDC to GCP
+
+env:
+  # ---- from GitHub → Settings → Secrets and variables → Actions → Variables ----
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+  REGION: ${{ vars.REGION }}                # e.g., us-central1
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}     # e.g., sa-deployer@<project>.iam.gserviceaccount.com
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}       # e.g., sa-scraper@<project>.iam.gserviceaccount.com
+  SCHEDULER_SA: ${{ vars.SCHEDULER_SA }}   # e.g., sa-scheduler@<project>.iam.gserviceaccount.com
+
+  # function config
+  FUNCTION_NAME: craigslist-scraper
+  GCS_BUCKET: ${{ vars.GCS_BUCKET }}       # target bucket for outputs
+  OUTPUT_PREFIX: craigslist
+  BASE_SITE: https://newhaven.craigslist.org
+  SEARCH_PATH: /search/cta
+  MAX_PAGES: '3'
+  REQUEST_DELAY_SECS: '1.0'
+  DETAIL_REQUEST_DELAY_SECS: '1.0'
+
+  # scheduler config
+  SCHEDULER_JOB_ID: craigslist-scraper-6h
+  CRON: '0 */6 * * *'                      # every 6 hours
+  TIMEZONE: 'America/New_York'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP via OIDC
+        id: auth
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      # (optional) enable services once; harmless if already enabled
+      - name: Enable required services (idempotent)
+        run: |
+          gcloud services enable \
+            cloudfunctions.googleapis.com run.googleapis.com \
+            artifactregistry.googleapis.com cloudscheduler.googleapis.com
+
+      - name: Deploy Cloud Function (Gen2)
+        run: |
+          set -euo pipefail
+          gcloud functions deploy "$FUNCTION_NAME" \
+            --gen2 \
+            --region="$REGION" \
+            --runtime=python311 \
+            --entry-point=scrape_http \
+            --trigger-http \
+            --service-account="$RUNTIME_SA" \
+            --no-allow-unauthenticated \
+            --timeout=540s \
+            --memory=1Gi \
+            --set-env-vars="GCS_BUCKET=$GCS_BUCKET,OUTPUT_PREFIX=$OUTPUT_PREFIX,BASE_SITE=$BASE_SITE,SEARCH_PATH=$SEARCH_PATH,MAX_PAGES=$MAX_PAGES,REQUEST_DELAY_SECS=$REQUEST_DELAY_SECS,DETAIL_REQUEST_DELAY_SECS=$DETAIL_REQUEST_DELAY_SECS"
+
+      - name: Get function URL
+        id: fn
+        run: |
+          URL="$(gcloud functions describe "$FUNCTION_NAME" --region="$REGION" --format='value(serviceConfig.uri)')"
+          echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Create/Update Cloud Scheduler job (OIDC)
+        run: |
+          set -euo pipefail
+          # try create, else update
+          gcloud scheduler jobs create http "$SCHEDULER_JOB_ID" \
+            --location="$REGION" \
+            --schedule="$CRON" \
+            --time-zone="$TIMEZONE" \
+            --http-method=POST \
+            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --oauth-service-account-email="$SCHEDULER_SA" \
+            --oauth-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --headers="Content-Type=application/json" \
+            --message-body='{"max_pages": 3, "prefix": "craigslist"}' \
+          || gcloud scheduler jobs update http "$SCHEDULER_JOB_ID" \
+            --location="$REGION" \
+            --schedule="$CRON" \
+            --time-zone="$TIMEZONE" \
+            --http-method=POST \
+            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --oauth-service-account-email="$SCHEDULER_SA" \
+            --oauth-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --headers="Content-Type=application/json" \
+            --message-body='{"max_pages": 3, "prefix": "craigslist"}'
+
+      - name: Done
+        run: |
+          echo "Deployed $FUNCTION_NAME and (up)dated scheduler $SCHEDULER_JOB_ID"
+          echo "Function URL: ${{ steps.fn.outputs.FUNCTION_URL }}"

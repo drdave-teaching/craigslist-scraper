@@ -249,7 +249,7 @@ def scrape_http(request: Request):
 ```
 
 # 2) `requirements.txt`
-```
+```python
 functions-framework==3.*
 google-cloud-storage>=2.16.0
 beautifulsoup4>=4.12.2
@@ -259,7 +259,7 @@ requests>=2.31.0
 ```
 
 # 3) One-time GCP setup (students run in Cloud Shell)
-```
+```python
 # set project/region
 PROJECT_ID="craigslist-scraper-v2"
 REGION="us-central1"
@@ -293,7 +293,7 @@ gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:$C
 ```
 
 # 4) Deploy the function (from the repo folder)
-```
+```python
 git clone https://github.com/drdave-teaching/craigslist-scraper.git
 cd craigslist-scraper
 
@@ -314,13 +314,13 @@ gcloud functions deploy "$FUNCTION" \
 ```
 
 ## Get the private URL
-```
+```python
 FUNC_URL="$(gcloud functions describe $FUNCTION --region=$REGION --format='value(serviceConfig.uri)')"
 echo $FUNC_URL
 ```
 
 ## Allow the scheduler to invoke
-```
+```python
 gcloud run services add-iam-policy-binding "$FUNCTION" \
   --region="$REGION" \
   --member="serviceAccount:$SCHEDULER_SA" \
@@ -328,7 +328,7 @@ gcloud run services add-iam-policy-binding "$FUNCTION" \
 ```
 
 # 5) Schedule every 6 hours (Cloud Scheduler, OIDC)
-```
+```python
 JOB_ID="craigslist-scraper-6h"
 
 gcloud scheduler jobs create http "$JOB_ID" \
@@ -354,7 +354,7 @@ gcloud scheduler jobs create http "$JOB_ID" \
 ```
 
 ## Manual test
-```
+```python
 gcloud scheduler jobs run "$JOB_ID" --location="$REGION"
 # or direct:
 curl -X POST "$FUNC_URL" -H "Authorization: Bearer $(gcloud auth print-identity-token)" \
@@ -370,7 +370,7 @@ gs://craigslist-data-craigslist-scraper-v2/craigslist/<YYYYMMDDTHHMMSSZ>/
 
 # 6) (Optional) “Don’t re-save old listings” tweak
 Add this helper and check before writing each TXT (you can find these in Dave's repo under `main.py`):
-```
+```python
 # near GCS helpers
 def gcs_blob_exists(bucket: str, path: str) -> bool:
     b = storage_client().bucket(bucket)

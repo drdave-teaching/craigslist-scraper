@@ -18,13 +18,13 @@ env:
   REGION: ${{ vars.REGION }}
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
-  RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # reuse sa-scraper (has GCS access)
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}
   SCHEDULER_SA: ${{ vars.SCHEDULER_SA }}
   FUNCTION_NAME: craigslist-model
   GCS_BUCKET: ${{ vars.GCS_BUCKET }}
   OUTPUT_PREFIX: craigslist
   JOB_ID: craigslist-model-6h
-  CRON: '10 */6 * * *'          # 10 minutes after the top of the 6th hour
+  CRON: '10 */6 * * *'
   TIMEZONE: 'America/New_York'
 
 jobs:
@@ -49,6 +49,15 @@ jobs:
             cloudfunctions.googleapis.com run.googleapis.com \
             artifactregistry.googleapis.com cloudscheduler.googleapis.com
 
+      # ✅ NEW: stage the model source with its own requirements.txt
+      - name: Stage model source
+        run: |
+          rm -rf model_src
+          mkdir -p model_src
+          cp model_main.py model_src/main.py
+          cp requirements_model.txt model_src/requirements.txt
+
+      # ✅ CHANGED: deploy from ./model_src (no --requirements flag in Gen2)
       - name: Deploy Model Function (Gen2)
         run: |
           gcloud functions deploy "$FUNCTION_NAME" \
@@ -61,8 +70,7 @@ jobs:
             --no-allow-unauthenticated \
             --timeout=540s \
             --memory=2Gi \
-            --source=. \
-            --requirements requirements_model.txt \
+            --source=./model_src \
             --set-env-vars="PROJECT_ID=$PROJECT_ID,GCS_BUCKET=$GCS_BUCKET,OUTPUT_PREFIX=$OUTPUT_PREFIX"
 
       - name: Get function URL

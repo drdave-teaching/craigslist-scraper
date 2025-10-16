@@ -1,0 +1,102 @@
+name: Deploy — Craigslist Model (Cloud Functions Gen2)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'model_main.py'
+      - 'requirements_model.txt'
+      - '.github/workflows/deploy-model.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+  REGION: ${{ vars.REGION }}
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # reuse sa-scraper (has GCS access)
+  SCHEDULER_SA: ${{ vars.SCHEDULER_SA }}
+  FUNCTION_NAME: craigslist-model
+  GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+  OUTPUT_PREFIX: craigslist
+  JOB_ID: craigslist-model-6h
+  CRON: '10 */6 * * *'          # 10 minutes after the top of the 6th hour
+  TIMEZONE: 'America/New_York'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Auth to GCP via OIDC
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required services (idempotent)
+        run: |
+          gcloud services enable \
+            cloudfunctions.googleapis.com run.googleapis.com \
+            artifactregistry.googleapis.com cloudscheduler.googleapis.com
+
+      - name: Deploy Model Function (Gen2)
+        run: |
+          gcloud functions deploy "$FUNCTION_NAME" \
+            --gen2 \
+            --region="$REGION" \
+            --runtime=python311 \
+            --entry-point=train_http \
+            --trigger-http \
+            --service-account="$RUNTIME_SA" \
+            --no-allow-unauthenticated \
+            --timeout=540s \
+            --memory=2Gi \
+            --source=. \
+            --requirements requirements_model.txt \
+            --set-env-vars="PROJECT_ID=$PROJECT_ID,GCS_BUCKET=$GCS_BUCKET,OUTPUT_PREFIX=$OUTPUT_PREFIX"
+
+      - name: Get function URL
+        id: fn
+        run: |
+          URL="$(gcloud functions describe "$FUNCTION_NAME" --region="$REGION" --format='value(serviceConfig.uri)')"
+          echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Grant run.invoker to Scheduler SA (idempotent)
+        run: |
+          gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
+            --region="$REGION" \
+            --member="serviceAccount:${{ env.SCHEDULER_SA }}" \
+            --role="roles/run.invoker" || true
+
+      - name: Create/Update Cloud Scheduler job (OIDC)
+        run: |
+          gcloud scheduler jobs create http "$JOB_ID" \
+            --location="$REGION" \
+            --schedule="$CRON" \
+            --time-zone="$TIMEZONE" \
+            --http-method=POST \
+            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --headers="Content-Type=application/json" \
+            --message-body='{}' \
+          || gcloud scheduler jobs update http "$JOB_ID" \
+            --location="$REGION" \
+            --schedule="$CRON" \
+            --time-zone="$TIMEZONE" \
+            --http-method=POST \
+            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --oidc-service-account-email="$SCHEDULER_SA" \
+            --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --headers="Content-Type=application/json" \
+            --message-body='{}'

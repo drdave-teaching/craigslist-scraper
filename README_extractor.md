@@ -160,3 +160,79 @@ google-cloud-storage>=2.16.0
 google-cloud-aiplatform>=1.56.0
 pydantic>=2.6.0
 ```
+
+# 2) One-time GCP setup for the extractor
+Run these in Cloud Shell (slow and steady):
+
+```python
+# --- variables ---
+PROJECT_ID="craigslist-scraper-v2"
+REGION="us-central1"
+BUCKET="craigslist-data-craigslist-scraper-v2"
+
+# service account for the extractor
+gcloud iam service-accounts create sa-extractor \
+  --display-name="CL Extractor SA"
+
+EXTRACTOR_SA="sa-extractor@$PROJECT_ID.iam.gserviceaccount.com"
+
+# enable needed services
+gcloud services enable \
+  aiplatform.googleapis.com \
+  eventarc.googleapis.com \
+  cloudfunctions.googleapis.com \
+  run.googleapis.com \
+  pubsub.googleapis.com
+
+# permissions: read/write bucket + Vertex AI
+gsutil iam ch serviceAccount:$EXTRACTOR_SA:roles/storage.objectAdmin gs://$BUCKET
+gcloud projects add-iam-policy-binding $PROJECT_ID \
+  --member="serviceAccount:$EXTRACTOR_SA" \
+  --role="roles/aiplatform.user"
+```
+
+# 3) Deploy the event-driven Cloud Function (Gen 2)
+From the folder that has `extractor_main.py` and `extractor_requirements.txt`:
+
+```python
+# if you cloned your repo in Cloud Shell:
+cd ~/craigslist-scraper
+
+# deploy the extractor; event trigger = GCS object finalized on your bucket
+gcloud functions deploy craigslist-extractor \
+  --gen2 \
+  --region="$REGION" \
+  --runtime=python311 \
+  --entry-point=etl_gcs \
+  --service-account="$EXTRACTOR_SA" \
+  --trigger-event-filters="type=google.cloud.storage.object.v1.finalized" \
+  --trigger-event-filters="bucket=$BUCKET" \
+  --timeout=540s \
+  --memory=1Gi \
+  --source=. \
+  --set-env-vars="PROJECT_ID=$PROJECT_ID,LOCATION=$REGION,GCS_BUCKET=$BUCKET" \
+  --requirements extractor_requirements.txt
+```
+
+# 4) Test it
+Pick one of your recent .txt paths and re-upload it to fire the trigger.
+
+```python
+# list a recent txt file
+gsutil ls gs://$BUCKET/craigslist/*/txt/*.txt | tail -n 1
+
+# copy it to a new name (re-uploads and triggers)
+LATEST_TXT="$(gsutil ls gs://$BUCKET/craigslist/*/txt/*.txt | tail -n 1)"
+RUN_PREFIX="$(dirname "$LATEST_TXT")"
+gsutil cp "$LATEST_TXT" "${RUN_PREFIX}/test-reupload.txt"
+```
+
+Now you should see a new JSON here:
+```
+gs://craigslist-data-craigslist-scraper-v2/craigslist/<run_id>/structured/json/<post_id>.json
+```
+
+# 5) How it integrates with your current pipeline
+* Your existing scraper still runs every 6 hours and writes index.csv + txt/.
+* Each new .txt automatically triggers the extractor and produces a JSON alongside it.
+* Later, we’ll create a BigQuery external table on .../structured/json/*.json. (No need to process historical runs unless you want to—just re-copy old .txt to re-emit JSON.)

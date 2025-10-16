@@ -1,7 +1,7 @@
 # 1) Files to add to your repo (or Cloud Shell folder)
-Add this to main branch `extractor_main.py`
+## Add these files to main branch `extractor_main.py`
 
-```
+```python
 # Event-driven extractor for new TXT files written by the scraper.
 # Trigger: GCS object finalized (any object); we early-exit unless it’s .../txt/*.txt
 # Output: one JSON per listing at .../structured/json/<post_id>.json
@@ -151,4 +151,12 @@ def etl_gcs(event):
     out_key = f"{run_prefix}/structured/json/{post_id}.json"
     write_json(BUCKET, out_key, item.dict())
     return f"wrote gs://{BUCKET}/{out_key}", 200
+```
+## `extractor_requirements.txt`
+
+```python
+functions-framework==3.*
+google-cloud-storage>=2.16.0
+google-cloud-aiplatform>=1.56.0
+pydantic>=2.6.0
 ```

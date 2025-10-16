@@ -1,4 +1,7 @@
-# 0) Repo layout (students)
+This scraper code is very good - but there are two ways to deploy. One is locally from GCP and the other is from your GitHub repo.
+
+# Path A: Running from GCP
+## 0) Repo layout (students)
 You can do this in VSCode or directly on GitHub.
 
 ```
@@ -11,7 +14,7 @@ craigslist-scraper/
       └─ deploy.yml        # optional CI; manual gcloud is fine too
 ```
 
-# 1) `main.py` (Cloud Functions Gen2 scraper → writes to GCS)
+## 1) `main.py` (Cloud Functions Gen2 scraper → writes to GCS)
 
 Runs the search, de-dupes by URL within a run, saves index.csv and one .txt per listing into a timestamped folder in Cloud Storage.
 ```python
@@ -248,7 +251,7 @@ def scrape_http(request: Request):
     }), 200
 ```
 
-# 2) `requirements.txt`
+## 2) `requirements.txt`
 ```python
 functions-framework==3.*
 google-cloud-storage>=2.16.0
@@ -258,7 +261,7 @@ pandas>=2.1.0
 requests>=2.31.0
 ```
 
-# 3) One-time GCP setup (students run in Cloud Shell)
+## 3) One-time GCP setup (students run in Cloud Shell)
 ```python
 # set project/region
 PROJECT_ID="craigslist-scraper-v2"
@@ -292,7 +295,7 @@ gcloud iam service-accounts add-iam-policy-binding "$RUNTIME_SA" --member="servi
 gcloud projects add-iam-policy-binding "$PROJECT_ID" --member="serviceAccount:$CLOUD_BUILD_SA" --role="roles/artifactregistry.writer"
 ```
 
-# 4) Deploy the function (from the repo folder)
+## 4) Deploy the function (from the repo folder)
 ```python
 git clone https://github.com/drdave-teaching/craigslist-scraper.git
 cd craigslist-scraper
@@ -327,7 +330,7 @@ gcloud run services add-iam-policy-binding "$FUNCTION" \
   --role="roles/run.invoker"
 ```
 
-# 5) Schedule every 6 hours (Cloud Scheduler, OIDC)
+## 5) Schedule every 6 hours (Cloud Scheduler, OIDC)
 ```python
 JOB_ID="craigslist-scraper-6h"
 
@@ -368,7 +371,7 @@ gs://craigslist-data-craigslist-scraper-v2/craigslist/<YYYYMMDDTHHMMSSZ>/
   └─ txt/*.txt
 ```
 
-# 6) (Optional) “Don’t re-save old listings” tweak
+## 6) (Optional) “Don’t re-save old listings” tweak
 Add this helper and check before writing each TXT (you can find these in Dave's repo under `main.py`):
 ```python
 # near GCS helpers

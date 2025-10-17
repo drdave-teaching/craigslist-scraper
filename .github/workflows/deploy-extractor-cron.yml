@@ -79,6 +79,12 @@ jobs:
             --region="${{ env.REGION }}" \
             --member="serviceAccount:${{ env.SCHEDULER_SA }}" \
             --role="roles/run.invoker" || true
+      
+      - name: Grant Scheduler admin to Deployer SA (idempotent)
+        run: |
+          gcloud projects add-iam-policy-binding "${{ env.PROJECT_ID }}" \
+            --member="serviceAccount:${{ env.DEPLOYER_SA }}" \
+            --role="roles/cloudscheduler.admin" || true
 
       - name: Create/Update 5-min scheduler
         run: |

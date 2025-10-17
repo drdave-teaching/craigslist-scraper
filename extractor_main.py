@@ -44,15 +44,20 @@ class Listing(BaseModel):
 
 # ---------- helpers ----------
 # a sensible retry for transient HTTPS errors
+import traceback
+
+# Global singleton client (avoid reconnect cost per invocation)
+_STORAGE = storage.Client()
 READ_RETRY = gax_retry.Retry(
     predicate=gax_retry.if_transient_error,
     initial=1.0, maximum=10.0, multiplier=2.0, deadline=120.0
 )
 
-def _read_text(bucket: str, key: str) -> str:
-    b = _sc().bucket(bucket).blob(key)
-    # use download_as_bytes + decode to avoid encoding surprises
-    bs = b.download_as_bytes(retry=READ_RETRY, timeout=120)
+def read_text(bucket: str, key: str) -> str:
+    """Resilient GCS read with retry + timeout."""
+    blob = _ STORAGE.bucket(bucket).blob(key)
+    # use bytes + decode; avoids odd encodings and lets us pass retry/timeout
+    bs = blob.download_as_bytes(retry=READ_RETRY, timeout=120)
     return bs.decode("utf-8", errors="replace")
 
 
@@ -137,27 +142,32 @@ def etl_gcs(event):
     if not name or not name.endswith(".txt") or "/txt/" not in name:
         return "ignored", 204
 
-    # Pull text, derive url + post_id
-    text = read_text(bucket, name)
-    url = parse_url_from_text(text)
-    post_id = post_id_from_any(name, text, url)
-    if not post_id:
-        logging.warning(f"no post_id for {name}; skipping")
-        return "no post_id", 204
+    try:
+        # Pull text, derive url + post_id
+        text = read_text(bucket, name)
+        url = parse_url_from_text(text)
+        post_id = post_id_from_any(name, text, url)
+        if not post_id:
+            logging.warning(f"no post_id for {name}; skipping")
+            return "no post_id", 204
 
-    # Run model → JSON, then validate/normalize via Pydantic
-    model = init_vertex()
-    raw = model_extract_json(model, text, url, post_id)
-    raw["post_id"] = post_id               # ensure set
-    raw["url"] = raw.get("url") or url     # prefer model, fallback to parsed
+        # Run model → JSON, then validate/normalize via Pydantic
+        model = init_vertex()
+        raw = model_extract_json(model, text, url, post_id)
+        raw["post_id"] = post_id               # ensure set
+        raw["url"] = raw.get("url") or url     # prefer model, fallback to parsed
 
-    item = Listing(**raw)  # raises if badly formed
+        item = Listing(**raw)  # raises if badly formed
 
-    # Write one JSON per listing
-    # Derive run_id = first 2 path parts after 'craigslist/', e.g. craigslist/<run_id>/txt/...
-    parts = name.split("/")
-    # name looks like: craigslist/<run_id>/txt/<file>.txt
-    run_prefix = "/".join(parts[:2])  # craigslist/<run_id>
-    out_key = f"{run_prefix}/structured/json/{post_id}.json"
-    write_json(BUCKET, out_key, item.dict())
-    return f"wrote gs://{BUCKET}/{out_key}", 200
+        # Write one JSON per listing
+        parts = name.split("/")                 # craigslist/<run_id>/txt/<file>.txt
+        run_prefix = "/".join(parts[:2])        # craigslist/<run_id>
+        out_key = f"{run_prefix}/structured/json/{post_id}.json"
+        write_json(BUCKET, out_key, item.dict())
+        logging.info(f"[extractor] wrote gs://{BUCKET}/{out_key}")
+        return f"wrote gs://{BUCKET}/{out_key}", 200
+
+    except Exception as e:
+        # Log full stack; return 500 so Eventarc retries on transient errors
+        logging.error(f"[extractor] failed {name}: {e}\n{traceback.format_exc()}")
+        return "error", 500

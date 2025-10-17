@@ -43,6 +43,21 @@ class Listing(BaseModel):
         return v.upper().replace(" ", "").replace("-", "")
 
 # ---------- helpers ----------
+PRICE_RE = re.compile(r"\$?\s*([0-9]{1,3}(?:[, ]?[0-9]{3})+|[0-9]{3,6})\b")
+
+# if numeric for price doesn't exist...
+def price_fallback(title: str, body: str) -> Optional[int]:
+    # Search title first (most reliable), then body
+    for s in (title or "", body or ""):
+        m = PRICE_RE.search(s)
+        if not m:
+            continue
+        n = int(re.sub(r"[^\d]", "", m.group(1)))
+        # sanity range for used cars; tweak if you like
+        if 500 <= n <= 150000:
+            return n
+    return None
+    
 # a sensible retry for transient HTTPS errors
 import traceback
 
@@ -83,6 +98,10 @@ def model_extract_json(model: GenerativeModel, text: str, url: Optional[str], po
     # Clear, test-like rules the model must follow
     system = (
         "You extract car-listing data as STRICT JSON that matches the provided schema. "
+        "Return integers for price/mileage (remove $ and commas.)"
+        "If price only appears in title like '$2,900', still set price=2900."
+        "Ignore phone numbers and ZIP codes; prefer a single plausible car-sale price."
+        "Use null when unknown."
         "If a field is unknown, use null. Follow these rules:\n"
         "1) price: integer USD with no symbols or commas; prefer an explicit 'Price:' line; "
         "   otherwise use a $#### pattern in the text. Example: '$3,900' -> 3900.\n"
@@ -96,6 +115,7 @@ def model_extract_json(model: GenerativeModel, text: str, url: Optional[str], po
         "8) body: include the free-text description (or best available body text).\n"
         "9) attrs_json: any bullet attributes as an object; if none, use {} (empty object), not a string.\n"
         "Return ONLY JSON — no prose."
+        "Don't hallucinate!"
     )
 
     schema = {
@@ -200,6 +220,11 @@ def etl_gcs(event, context=None):
         raw = model_extract_json(model, text, url, post_id)
         raw["post_id"] = post_id               # ensure set
         raw["url"] = raw.get("url") or url     # prefer model, fallback to parsed
+        # prefer model, but backfill if missing...
+        if raw.get("price") is None:
+            p = price_fallback(raw.get("title") or "", raw.get("body") or "")
+            if p is not None:
+                raw["price"] = p
         item = Listing(**raw)                  # validate
 
         # Write JSON beside the run folder

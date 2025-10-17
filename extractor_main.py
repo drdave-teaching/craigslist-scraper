@@ -8,6 +8,7 @@ from google.cloud import storage
 from vertexai.preview.generative_models import GenerativeModel, Part
 import vertexai
 from pydantic import BaseModel, Field, validator
+from google.api_core import retry as gax_retry
 
 PROJECT_ID = os.getenv("PROJECT_ID")
 LOCATION   = os.getenv("LOCATION", "us-central1")
@@ -42,6 +43,19 @@ class Listing(BaseModel):
         return v.upper().replace(" ", "").replace("-", "")
 
 # ---------- helpers ----------
+# a sensible retry for transient HTTPS errors
+READ_RETRY = gax_retry.Retry(
+    predicate=gax_retry.if_transient_error,
+    initial=1.0, maximum=10.0, multiplier=2.0, deadline=120.0
+)
+
+def _read_text(bucket: str, key: str) -> str:
+    b = _sc().bucket(bucket).blob(key)
+    # use download_as_bytes + decode to avoid encoding surprises
+    bs = b.download_as_bytes(retry=READ_RETRY, timeout=120)
+    return bs.decode("utf-8", errors="replace")
+
+
 def init_vertex() -> GenerativeModel:
     vertexai.init(project=PROJECT_ID, location=LOCATION)
     return GenerativeModel("gemini-1.5-pro")

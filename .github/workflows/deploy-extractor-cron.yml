@@ -73,6 +73,12 @@ jobs:
           echo "FUNCTION_URL=$URL"
           echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
 
+      - name: Grant Scheduler admin to Deployer SA (idempotent)
+        run: |
+          gcloud projects add-iam-policy-binding "${{ env.PROJECT_ID }}" \
+            --member="serviceAccount:${{ env.DEPLOYER_SA }}" \
+            --role="roles/cloudscheduler.admin" || true
+
       - name: Allow Scheduler SA to invoke
         run: |
           gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
@@ -80,11 +86,6 @@ jobs:
             --member="serviceAccount:${{ env.SCHEDULER_SA }}" \
             --role="roles/run.invoker" || true
       
-      - name: Grant Scheduler admin to Deployer SA (idempotent)
-        run: |
-          gcloud projects add-iam-policy-binding "${{ env.PROJECT_ID }}" \
-            --member="serviceAccount:${{ env.DEPLOYER_SA }}" \
-            --role="roles/cloudscheduler.admin" || true
 
       - name: Create/Update 5-min scheduler
         run: |

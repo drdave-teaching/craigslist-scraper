@@ -19,6 +19,7 @@ env:
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
   DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
   RUNTIME_SA: ${{ vars.RUNTIME_SA }}
+  SCHEDULER_SA: ${{ vars.SCHEDULER_SA }}   # ✅ added
   GCS_BUCKET: ${{ vars.GCS_BUCKET }}
   OUTPUT_PREFIX: craigslist
   FUNCTION_NAME: extractor-cron
@@ -39,6 +40,14 @@ jobs:
           project_id: ${{ env.PROJECT_ID }}
 
       - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required services (idempotent)   # ✅ added
+        run: |
+          gcloud services enable \
+            cloudfunctions.googleapis.com \
+            run.googleapis.com \
+            artifactregistry.googleapis.com \
+            cloudscheduler.googleapis.com
 
       - name: Stage src
         run: |
@@ -61,6 +70,7 @@ jobs:
         id: fn
         run: |
           URL="$(gcloud functions describe "$FUNCTION_NAME" --region="${{ env.REGION }}" --format='value(serviceConfig.uri)')"
+          echo "FUNCTION_URL=$URL"
           echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
 
       - name: Allow Scheduler SA to invoke

@@ -80,38 +80,66 @@ def post_id_from_any(name: str, text: str, url: Optional[str]) -> Optional[str]:
     return None
 
 def model_extract_json(model: GenerativeModel, text: str, url: Optional[str], post_id: str) -> dict:
+    # Clear, test-like rules the model must follow
     system = (
-        "Extract car listing data as strict JSON only. "
-        "If unknown, use null. Price/mileage are integers. "
-        "Transmission one of: Automatic, Manual, CVT, Other, Unknown."
+        "You extract car-listing data as STRICT JSON that matches the provided schema. "
+        "If a field is unknown, use null. Follow these rules:\n"
+        "1) price: integer USD with no symbols or commas; prefer an explicit 'Price:' line; "
+        "   otherwise use a $#### pattern in the text. Example: '$3,900' -> 3900.\n"
+        "2) year: 4-digit vehicle year (1950–2100), prefer the listing title, else attributes/body.\n"
+        "3) make: manufacturer (e.g., Honda, Hyundai, Toyota). Only the brand name.\n"
+        "4) model: vehicle family ONLY (e.g., Civic, Sonata, Camry). "
+        "   DO NOT include trim (e.g., LX, SE), currency symbols, location names, mileage, or the year.\n"
+        "5) trim: optional submodel/grade (e.g., LX, SE, Limited). Put trims here, not in model.\n"
+        "6) location: prefer the 'Neighborhood' / hood field if present; otherwise a clear location token from text.\n"
+        "7) posted_iso: if a timestamp is present, keep ISO-8601 (UTC or with offset).\n"
+        "8) body: include the free-text description (or best available body text).\n"
+        "9) attrs_json: any bullet attributes as an object; if none, use {} (empty object), not a string.\n"
+        "Return ONLY JSON — no prose."
     )
+
     schema = {
-        "type":"object",
-        "properties":{
-            "post_id":{"type":"string"},
-            "url":{"type":["string","null"]},
-            "title":{"type":["string","null"]},
-            "price":{"type":["integer","null"]},
-            "year":{"type":["integer","null"]},
-            "make":{"type":["string","null"]},
-            "model":{"type":["string","null"]},
-            "trim":{"type":["string","null"]},
-            "mileage":{"type":["integer","null"]},
-            "vin":{"type":["string","null"]},
-            "color":{"type":["string","null"]},
-            "transmission":{"type":["string","null"]},
-            "condition":{"type":["string","null"]},
-            "location":{"type":["string","null"]},
-            "posted_iso":{"type":["string","null"]},
-            "body":{"type":["string","null"]},
-            "attrs_json":{"type":["object","null"]}
+        "type": "object",
+        "properties": {
+            "post_id": {"type": "string"},
+            "url": {"type": ["string", "null"]},
+            "title": {"type": ["string", "null"]},
+            "price": {"type": ["integer", "null"]},
+            "year": {"type": ["integer", "null"]},
+            "make": {"type": ["string", "null"]},
+            "model": {"type": ["string", "null"]},
+            "trim": {"type": ["string", "null"]},
+            "mileage": {"type": ["integer", "null"]},
+            "vin": {"type": ["string", "null"]},
+            "color": {"type": ["string", "null"]},
+            "transmission": {"type": ["string", "null"]},
+            "condition": {"type": ["string", "null"]},
+            "location": {"type": ["string", "null"]},
+            "posted_iso": {"type": ["string", "null"]},
+            "body": {"type": ["string", "null"]},
+            "attrs_json": {"type": ["object", "null"]}
         },
-        "required":["post_id"]
+        "required": ["post_id"]
     }
-    prompt = (
-        f"{system}\n\nPOST_ID: {post_id}\nURL: {url or ''}\n\n"
-        "LISTING TEXT:\n" + text + "\n\nReturn ONLY JSON."
+
+    # Two tiny few-shot hints to steer parsing of price/model
+    fewshot = (
+        "EXAMPLE 1 TITLE: 2016 Honda Civic LX - $9,900 - West Haven\n"
+        "→ price=9900, year=2016, make=Honda, model=Civic, trim=LX, location=West Haven\n"
+        "EXAMPLE 2 TITLE: 2013 Hyundai Sonata GLS $3,900 Milford\n"
+        "→ price=3900, year=2013, make=Hyundai, model=Sonata, trim=GLS, location=Milford\n"
     )
+
+    prompt = (
+        f"{system}\n\n"
+        f"{fewshot}\n"
+        f"POST_ID: {post_id}\n"
+        f"URL: {url or ''}\n\n"
+        "LISTING TEXT:\n"
+        f"{text}\n\n"
+        "Return ONLY JSON that conforms to the schema."
+    )
+
     resp = model.generate_content(
         [Part.from_text(prompt)],
         generation_config={
@@ -120,6 +148,7 @@ def model_extract_json(model: GenerativeModel, text: str, url: Optional[str], po
         }
     )
     return json.loads(resp.text)
+
 
 def write_json(bucket: str, key: str, data: dict):
     client = storage.Client()

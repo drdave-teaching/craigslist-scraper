@@ -1,0 +1,94 @@
+name: Deploy — Extractor Cron (Gen2)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'extractor_cron.py'
+      - 'requirements_extractor_cron.txt'
+      - '.github/workflows/deploy-extractor-cron.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+  REGION: ${{ vars.REGION }}
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}
+  GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+  OUTPUT_PREFIX: craigslist
+  FUNCTION_NAME: extractor-cron
+  JOB_ID: extractor-cron-5m
+  CRON: '*/5 * * * *'
+  TIMEZONE: 'America/New_York'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Stage src
+        run: |
+          rm -rf cron_src
+          mkdir -p cron_src
+          cp extractor_cron.py cron_src/main.py
+          cp requirements_extractor_cron.txt cron_src/requirements.txt
+
+      - name: Deploy function
+        run: |
+          gcloud functions deploy "$FUNCTION_NAME" \
+            --gen2 --region="${{ env.REGION }}" --runtime=python311 \
+            --entry-point=extract_http --trigger-http \
+            --service-account="${{ env.RUNTIME_SA }}" \
+            --no-allow-unauthenticated --timeout=300s --memory=512Mi \
+            --source=./cron_src \
+            --set-env-vars="GCS_BUCKET=${{ env.GCS_BUCKET }},OUTPUT_PREFIX=${{ env.OUTPUT_PREFIX }}"
+
+      - name: Get URL
+        id: fn
+        run: |
+          URL="$(gcloud functions describe "$FUNCTION_NAME" --region="${{ env.REGION }}" --format='value(serviceConfig.uri)')"
+          echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
+
+      - name: Allow Scheduler SA to invoke
+        run: |
+          gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
+            --region="${{ env.REGION }}" \
+            --member="serviceAccount:${{ env.SCHEDULER_SA }}" \
+            --role="roles/run.invoker" || true
+
+      - name: Create/Update 5-min scheduler
+        run: |
+          gcloud scheduler jobs create http "$JOB_ID" \
+            --location="${{ env.REGION }}" \
+            --schedule="${{ env.CRON }}" \
+            --time-zone="${{ env.TIMEZONE }}" \
+            --http-method=POST \
+            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
+            --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --headers="Content-Type=application/json" \
+            --message-body='{}' \
+          || gcloud scheduler jobs update http "$JOB_ID" \
+            --location="${{ env.REGION }}" \
+            --schedule="${{ env.CRON }}" \
+            --time-zone="${{ env.TIMEZONE }}" \
+            --http-method=POST \
+            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
+            --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+            --headers="Content-Type=application/json" \
+            --message-body='{}'

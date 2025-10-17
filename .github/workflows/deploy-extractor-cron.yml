@@ -82,23 +82,33 @@ jobs:
 
       - name: Create/Update 5-min scheduler
         run: |
-          gcloud scheduler jobs create http "$JOB_ID" \
-            --location="${{ env.REGION }}" \
-            --schedule="${{ env.CRON }}" \
-            --time-zone="${{ env.TIMEZONE }}" \
-            --http-method=POST \
-            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
-            --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --headers="Content-Type=application/json" \
-            --message-body='{}' \
-          || gcloud scheduler jobs update http "$JOB_ID" \
-            --location="${{ env.REGION }}" \
-            --schedule="${{ env.CRON }}" \
-            --time-zone="${{ env.TIMEZONE }}" \
-            --http-method=POST \
-            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
-            --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --headers="Content-Type=application/json" \
-            --message-body='{}'
+          set -euo pipefail
+
+          JOB_EXISTS="$(gcloud scheduler jobs describe "$JOB_ID" --location="${{ env.REGION }}" --format='value(name)' || true)"
+
+          if [[ -z "$JOB_EXISTS" ]]; then
+            echo "Creating scheduler job $JOB_ID..."
+            gcloud scheduler jobs create http "$JOB_ID" \
+              --location="${{ env.REGION }}" \
+              --schedule="${{ env.CRON }}" \
+              --time-zone="${{ env.TIMEZONE }}" \
+              --http-method=POST \
+              --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
+              --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --headers="Content-Type=application/json" \
+              --message-body='{}'
+          else
+            echo "Updating scheduler job $JOB_ID..."
+            gcloud scheduler jobs update http "$JOB_ID" \
+              --location="${{ env.REGION }}" \
+              --schedule="${{ env.CRON }}" \
+              --time-zone="${{ env.TIMEZONE }}" \
+              --http-method=POST \
+              --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
+              --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --update-headers="Content-Type=application/json" \
+              --message-body='{}'
+          fi
+

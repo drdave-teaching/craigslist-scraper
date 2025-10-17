@@ -161,11 +161,26 @@ def read_text(bucket: str, key: str) -> str:
     return client.bucket(bucket).blob(key).download_as_text()
 
 # ---------- CloudEvent entrypoint ----------
-def etl_gcs(event):
-    # event.data holds { bucket, name, ... }
-    data = event.data if hasattr(event, "data") else event
-    bucket = data.get("bucket")
-    name   = data.get("name")  # object path
+from typing import Any, Tuple
+
+def _get_bucket_name_from_event(event: Any, context: Any) -> Tuple[str, str]:
+    """
+    Supports BOTH formats:
+    - Background (legacy): etl_gcs(data: dict, context)
+      where data = {"bucket": "...", "name": "..."}
+    - CloudEvent (Eventarc/Gen2): etl_gcs(event)
+      where event.data = {"bucket": "...", "name": "..."}
+    """
+    # background (2 args)
+    if context is not None and isinstance(event, dict):
+        return event.get("bucket"), event.get("name")
+
+    # cloudevent (1 arg)
+    ce = getattr(event, "data", None) or event
+    return (ce or {}).get("bucket"), (ce or {}).get("name")
+
+def etl_gcs(event, context=None):
+    bucket, name = _get_bucket_name_from_event(event, context)
 
     # Only handle TXT files the scraper created
     if not name or not name.endswith(".txt") or "/txt/" not in name:
@@ -185,10 +200,9 @@ def etl_gcs(event):
         raw = model_extract_json(model, text, url, post_id)
         raw["post_id"] = post_id               # ensure set
         raw["url"] = raw.get("url") or url     # prefer model, fallback to parsed
+        item = Listing(**raw)                  # validate
 
-        item = Listing(**raw)  # raises if badly formed
-
-        # Write one JSON per listing
+        # Write JSON beside the run folder
         parts = name.split("/")                 # craigslist/<run_id>/txt/<file>.txt
         run_prefix = "/".join(parts[:2])        # craigslist/<run_id>
         out_key = f"{run_prefix}/structured/json/{post_id}.json"
@@ -197,6 +211,6 @@ def etl_gcs(event):
         return f"wrote gs://{BUCKET}/{out_key}", 200
 
     except Exception as e:
-        # Log full stack; return 500 so Eventarc retries on transient errors
+        import traceback
         logging.error(f"[extractor] failed {name}: {e}\n{traceback.format_exc()}")
-        return "error"
+        return "error", 500

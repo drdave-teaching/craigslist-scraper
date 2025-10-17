@@ -63,17 +63,31 @@ import traceback
 
 # Global singleton client (avoid reconnect cost per invocation)
 _STORAGE = storage.Client()
+_SC = None
+
+def _sc() -> storage.Client:
+    global _SC
+    if _SC is None:
+        _SC = storage.Client()
+    return _SC
+
 READ_RETRY = gax_retry.Retry(
     predicate=gax_retry.if_transient_error,
     initial=1.0, maximum=10.0, multiplier=2.0, deadline=120.0
 )
 
 def read_text(bucket: str, key: str) -> str:
-    """Resilient GCS read with retry + timeout."""
-    blob = _ STORAGE.bucket(bucket).blob(key)
-    # use bytes + decode; avoids odd encodings and lets us pass retry/timeout
+    # download_as_bytes + decode is more robust than download_as_text
+    blob = _sc().bucket(bucket).blob(key)
     bs = blob.download_as_bytes(retry=READ_RETRY, timeout=120)
     return bs.decode("utf-8", errors="replace")
+
+def write_json(bucket: str, key: str, data: dict):
+    blob = _sc().bucket(bucket).blob(key)
+    blob.upload_from_string(
+        json.dumps(data, ensure_ascii=False),
+        content_type="application/json",
+    )
 
 
 def init_vertex() -> GenerativeModel:

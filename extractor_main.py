@@ -170,4 +170,4 @@ def etl_gcs(event):
     except Exception as e:
         # Log full stack; return 500 so Eventarc retries on transient errors
         logging.error(f"[extractor] failed {name}: {e}\n{traceback.format_exc()}")
-        return "error", 500
+        return "error"

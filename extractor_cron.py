@@ -387,7 +387,7 @@ def extract_http(request: Request):
             item = Listing(**merged)
 
             # write JSON (overwrite allowed)
-            out_key = f"{PREFIX}/{run_id}/structured/json/{post_id}.json"
+            out_key = f"{PREFIX}/{run_id}/structured/json2/{post_id}.json"
             _upload_json(out_key, item.dict())
             written += 1
 

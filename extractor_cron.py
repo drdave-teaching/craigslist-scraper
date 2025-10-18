@@ -1,71 +1,192 @@
-# HTTP cron extractor for GCF Gen2. No Eventarc.
-# Scans GCS for new craigslist/*/txt/*.txt, writes JSON to craigslist/*/structured/json/*.json
-# Tracks processed TXT keys in craigslist/state/last_extracted.txt
+# HTTP cron extractor for GCF Gen2 (no Eventarc).
+# - Scans gs://$GCS_BUCKET/$OUTPUT_PREFIX/<run_id>/txt/*.txt
+# - Writes JSON to .../<run_id>/structured/json/<post_id>.json
+# - Keeps per-run "processed" state so cron jobs don't reprocess the same TXT
+#
+# Trigger:
+#   Cloud Scheduler -> HTTP POST (optionally: {"run_id":"YYYYMMDDThhmmssZ"})
+#
+# Env:
+#   PROJECT_ID      (e.g., "craigslist-scraper-v2")
+#   LOCATION        (e.g., "us-central1")
+#   GCS_BUCKET      (e.g., "craigslist-data-<project>")
+#   OUTPUT_PREFIX   (default "craigslist")
 
-import os, io, json, re, logging, traceback
-from typing import Dict, List, Set
-from google.cloud import storage
+import os, re, json, logging, traceback
+from typing import Optional, List, Dict, Set
+
 from flask import Request, jsonify
+from google.cloud import storage
+from google.api_core import retry as gax_retry
 
-BUCKET = os.getenv("GCS_BUCKET")
-PREFIX = os.getenv("OUTPUT_PREFIX", "craigslist")
-STATE_KEY = f"{PREFIX}/state/last_extracted.txt"   # stores processed blob names
+import vertexai
+from vertexai.preview.generative_models import GenerativeModel, Part
 
-POST_ID_RE = re.compile(r"/(\d{8,12})\.html")
-PRICE_RE   = re.compile(r"\$?([\d,]+)")
-YEAR_RE    = re.compile(r"\b(19|20)\d{2}\b")
+from pydantic import BaseModel, Field, validator
 
-def _sc():
-    return storage.Client()
+# -------------------- Config / Env --------------------
 
-def _read_text(bucket: str, key: str) -> str:
-    return _sc().bucket(bucket).blob(key).download_as_text()
+PROJECT_ID = os.getenv("PROJECT_ID")
+LOCATION   = os.getenv("LOCATION", "us-central1")
+BUCKET     = os.getenv("GCS_BUCKET")
+PREFIX     = os.getenv("OUTPUT_PREFIX", "craigslist")
 
-def _write_json(bucket: str, key: str, data: dict):
-    _sc().bucket(bucket).blob(key).upload_from_string(
-        json.dumps(data, ensure_ascii=False), content_type="application/json"
+# Per-run processed state: gs://<bucket>/<PREFIX>/state/<run_id>.txt
+STATE_PREFIX = f"{PREFIX}/state"
+
+# -------------------- Globals --------------------
+
+_SC: Optional[storage.Client] = None
+_MODEL: Optional[GenerativeModel] = None
+
+READ_RETRY = gax_retry.Retry(
+    predicate=gax_retry.if_transient_error,
+    initial=1.0, maximum=10.0, multiplier=2.0, deadline=120.0
+)
+
+# Regex helpers
+POST_ID_RE = re.compile(r"/([0-9]{8,12})\.html")
+FNAME_ID_RE = re.compile(r"([0-9]{8,12})")
+YEAR_RE     = re.compile(r"\b(19|20)\d{2}\b")
+PRICE_LINE_RE = re.compile(r"\$?([\d,]+)")  # for "Price: $12,345" line
+PRICE_FALLBACK_RE = re.compile(r"\$?\s*([0-9]{1,3}(?:[, ]?[0-9]{3})+|[0-9]{3,6})\b")
+
+# -------------------- Storage helpers --------------------
+
+def _sc() -> storage.Client:
+    global _SC
+    if _SC is None:
+        _SC = storage.Client()
+    return _SC
+
+def _b() -> storage.Bucket:
+    return _sc().bucket(BUCKET)
+
+def _download_text(key: str) -> str:
+    bs = _b().blob(key).download_as_bytes(retry=READ_RETRY, timeout=120)
+    return bs.decode("utf-8", errors="replace")
+
+def _upload_json(key: str, data: dict):
+    _b().blob(key).upload_from_string(
+        json.dumps(data, ensure_ascii=False),
+        content_type="application/json"
     )
 
-def _read_state(bucket: str, key: str) -> Set[str]:
-    b = _sc().bucket(bucket).blob(key)
-    if not b.exists():
+def _read_state(run_id: str) -> Set[str]:
+    """Per-run set of processed TXT blob names."""
+    key = f"{STATE_PREFIX}/{run_id}.txt"
+    bl = _b().blob(key)
+    if not bl.exists():
         return set()
     try:
-        return set(ln.strip() for ln in b.download_as_text().splitlines() if ln.strip())
+        txt = bl.download_as_text()
+        return set(line.strip() for line in txt.splitlines() if line.strip())
     except Exception:
-        # corrupt/empty → reset
         return set()
 
-def _write_state(bucket: str, key: str, processed: Set[str]):
+def _write_state(run_id: str, processed: Set[str]):
+    key = f"{STATE_PREFIX}/{run_id}.txt"
     text = "\n".join(sorted(processed))
-    _sc().bucket(bucket).blob(key).upload_from_string(text, content_type="text/plain")
+    _b().blob(key).upload_from_string(text, content_type="text/plain")
+
+# -------------------- Vertex / schema --------------------
+
+def _model() -> GenerativeModel:
+    global _MODEL
+    if _MODEL is None:
+        vertexai.init(project=PROJECT_ID, location=LOCATION)
+        _MODEL = GenerativeModel("gemini-1.5-pro")
+    return _MODEL
+
+class Listing(BaseModel):
+    post_id: str
+    url: Optional[str]
+    title: Optional[str]
+    price: Optional[int] = Field(None, ge=0)
+    year: Optional[int] = Field(None, ge=1950, le=2100)
+    make: Optional[str]
+    model: Optional[str]
+    trim: Optional[str] = None
+    mileage: Optional[int] = Field(None, ge=0)
+    vin: Optional[str] = None
+    color: Optional[str] = None
+    transmission: Optional[str] = None
+    condition: Optional[str] = None
+    location: Optional[str] = None
+    posted_iso: Optional[str] = None
+    body: Optional[str] = None
+    attrs_json: Optional[dict] = None
+
+    @validator("vin")
+    def _clean_vin(cls, v):
+        if not v: return v
+        return v.upper().replace(" ", "").replace("-", "")
+
+def model_extract_json(text: str, url: Optional[str], post_id: str) -> Dict:
+    system = (
+        "Extract car listing data as STRICT JSON matching the schema. "
+        "Integers for price and mileage (remove $ and commas). "
+        "If price appears only in the TITLE like '$2,900', set price=2900. "
+        "Ignore phone numbers and ZIP codes when deciding price. "
+        "Transmission one of: Automatic, Manual, CVT, Other, Unknown. "
+        "Use null when unknown. Output ONLY JSON."
+    )
+    schema = {
+        "type":"object",
+        "properties":{
+            "post_id":{"type":"string"},
+            "url":{"type":["string","null"]},
+            "title":{"type":["string","null"]},
+            "price":{"type":["integer","null"]},
+            "year":{"type":["integer","null"]},
+            "make":{"type":["string","null"]},
+            "model":{"type":["string","null"]},
+            "trim":{"type":["string","null"]},
+            "mileage":{"type":["integer","null"]},
+            "vin":{"type":["string","null"]},
+            "color":{"type":["string","null"]},
+            "transmission":{"type":["string","null"]},
+            "condition":{"type":["string","null"]},
+            "location":{"type":["string","null"]},
+            "posted_iso":{"type":["string","null"]},
+            "body":{"type":["string","null"]},
+            "attrs_json":{"type":["object","null"]}
+        },
+        "required":["post_id"]
+    }
+    fewshot = (
+        "EX1: 2016 Honda Civic LX - $9,900 - West Haven → "
+        "price=9900, year=2016, make=Honda, model=Civic, trim=LX, location='West Haven'\n"
+        "EX2: 2013 Hyundai Sonata GLS $3,900 Milford → "
+        "price=3900, year=2013, make=Hyundai, model=Sonata, trim=GLS, location='Milford'\n"
+    )
+    prompt = (
+        f"{system}\n\n{fewshot}\n"
+        f"POST_ID: {post_id}\nURL: {url or ''}\n\nLISTING TEXT:\n{text}\n\nReturn ONLY JSON."
+    )
+    resp = _model().generate_content(
+        [Part.from_text(prompt)],
+        generation_config={
+            "response_mime_type": "application/json",
+            "response_schema": schema
+        }
+    )
+    return json.loads(resp.text)
+
+# -------------------- Deterministic TXT parsing --------------------
 
 def _ensure_misc_list(attrs: dict):
-    """
-    Ensure attrs['misc'] is always a list before appending.
-    Handles cases where a prior run accidentally stored a string.
-    """
     if not isinstance(attrs.get("misc"), list):
         attrs["misc"] = []
     return attrs["misc"]
 
 def parse_txt(body: str) -> Dict:
     """
-    Expected lines from scraper:
-      Title: ...
-      Price: $12345
-      Neighborhood: ...
-      URL: https://.../1234567890.html
-      Posted: 2025-01-01T12:34:56Z
-      Attributes:
-        - odometer: 123,456
-        - (sometimes bare flags like "clean title")
-      ----------------------------------------
-      BODY:
-      free text...
+    Parses the scraper-made TXT format into a dict (best-effort).
+    Fields: title, price, location, url, posted_iso, attrs_json, body, year/make/model heuristics.
     """
     lines = body.splitlines()
-    data = {"attrs_json": {}}
+    data: Dict = {"attrs_json": {}}
     i = 0
     while i < len(lines):
         line = lines[i].strip()
@@ -74,7 +195,7 @@ def parse_txt(body: str) -> Dict:
             data["title"] = line.split(":", 1)[1].strip() or None
 
         elif line.startswith("Price:"):
-            m = PRICE_RE.search(line)
+            m = PRICE_LINE_RE.search(line)
             data["price"] = int(m.group(1).replace(",", "")) if m else None
 
         elif line.startswith("Neighborhood:"):
@@ -89,34 +210,32 @@ def parse_txt(body: str) -> Dict:
         elif line.startswith("Attributes:"):
             i += 1
             while i < len(lines) and lines[i].strip().startswith("-"):
-                kv = lines[i].strip()[1:].strip()  # drop leading "- "
+                kv = lines[i].strip()[1:].strip()
                 if ":" in kv:
                     k, v = kv.split(":", 1)
                     data["attrs_json"][k.strip().lower()] = v.strip()
                 else:
-                    # bare flags like "clean title"
                     misc = _ensure_misc_list(data["attrs_json"])
                     misc.append(kv)
                 i += 1
-            continue  # we've already advanced i inside this block
+            continue  # already advanced i
 
         elif line == "BODY:" or line.endswith("BODY:"):
-            # everything after this is free text
             data["body"] = "\n".join(lines[i+1:]).strip()
             break
 
         i += 1
 
-    # Heuristics: year/make/model from title
+    # Year/make/model heuristics from title
     title = data.get("title") or ""
     ym = YEAR_RE.search(title)
     data["year"] = int(ym.group(0)) if ym else None
-    title_wo_year = YEAR_RE.sub("", title).strip()
-    parts = title_wo_year.split()
+    t2 = YEAR_RE.sub("", title).strip()
+    parts = re.split(r"\s+", t2) if t2 else []
     data["make"]  = parts[0].title() if parts else None
     data["model"] = " ".join(parts[1:3]).title() if len(parts) > 1 else None
 
-    # Post ID from URL if possible
+    # Post ID from URL if available
     if data.get("url"):
         m = POST_ID_RE.search(data["url"])
         if m:
@@ -124,60 +243,161 @@ def parse_txt(body: str) -> Dict:
 
     return data
 
+# -------------------- Misc helpers --------------------
+
+def parse_url_from_text(text: str) -> Optional[str]:
+    for line in text.splitlines():
+        if line.strip().lower().startswith("url:"):
+            return line.split(":", 1)[1].strip()
+    return None
+
+def post_id_from_any(name: str, text: str, url: Optional[str]) -> Optional[str]:
+    for s in (name, url or "", text):
+        m = FNAME_ID_RE.search(s)
+        if m: return m.group(1)
+        m2 = POST_ID_RE.search(s)
+        if m2: return m2.group(1)
+    return None
+
+def price_fallback(title: str, body: str) -> Optional[int]:
+    for s in (title or "", body or ""):
+        m = PRICE_FALLBACK_RE.search(s)
+        if not m:
+            continue
+        n = int(re.sub(r"[^\d]", "", m.group(1)))
+        if 500 <= n <= 150_000:
+            return n
+    return None
+
+def _list_run_ids() -> List[str]:
+    # prefixes like 'craigslist/20251017T185944Z/'
+    it = _sc().list_blobs(BUCKET, prefix=f"{PREFIX}/", delimiter="/")
+    # storage client exposes .prefixes on the iterator
+    run_ids = []
+    for p in getattr(it, "prefixes", []):
+        # p == 'craigslist/<run_id>/' → grab <run_id>
+        parts = p.strip("/").split("/")
+        if len(parts) == 2 and parts[0] == PREFIX:
+            run_ids.append(parts[1])
+    return sorted(run_ids)
+
+def _list_txt_for_run(run_id: str) -> List[str]:
+    pfx = f"{PREFIX}/{run_id}/txt/"
+    return [b.name for b in _sc().list_blobs(BUCKET, prefix=pfx) if b.name.endswith(".txt")]
+
+# -------------------- HTTP entry point --------------------
+
 def extract_http(request: Request):
-    if not BUCKET:
-        return jsonify({"error": "missing GCS_BUCKET"}), 500
+    logging.getLogger().setLevel(logging.INFO)
 
-    # load state of processed TXT object names
-    done = _read_state(BUCKET, STATE_KEY)
+    if not (PROJECT_ID and BUCKET):
+        return jsonify({"ok": False, "error": "missing PROJECT_ID or GCS_BUCKET"}), 500
 
-    # find new txt files
-    sc = _sc()
-    to_process: List[str] = []
-    for blob in sc.list_blobs(BUCKET, prefix=f"{PREFIX}/"):
-        n = blob.name
-        if n.endswith(".txt") and "/txt/" in n and n not in done:
-            to_process.append(n)
+    # Accept JSON body: {"run_id":"YYYYMMDDThhmmssZ", "max_files": 100, "overwrite": false}
+    try:
+        body = request.get_json(silent=True) or {}
+    except Exception:
+        body = {}
 
-    processed_now: List[str] = []
+    run_id = body.get("run_id")
+    max_files = int(body.get("max_files") or 0)  # 0 = no limit
+    overwrite = bool(body.get("overwrite") or False)
+
+    # Pick newest run if none provided
+    if not run_id:
+        runs = _list_run_ids()
+        if not runs:
+            return jsonify({"ok": False, "error": "no runs found under prefix", "prefix": PREFIX}), 200
+        run_id = runs[-1]
+
+    # Gather candidates
+    txt_names = _list_txt_for_run(run_id)
+    processed_state = _read_state(run_id)
+
+    # Optionally skip ones we've done already (unless overwrite=True)
+    if not overwrite:
+        txt_names = [n for n in txt_names if n not in processed_state]
+
+    if max_files > 0:
+        txt_names = txt_names[:max_files]
+
+    processed = 0
     written = 0
     errors = 0
 
-    for name in to_process:
+    # Init model once per request
+    try:
+        _model()
+    except Exception as e:
+        logging.error(f"[extractor-cron] Vertex init failed: {e}\n{traceback.format_exc()}")
+        return jsonify({"ok": False, "error": "vertex_init_failed"}), 500
+
+    for name in txt_names:
         try:
-            text = _read_text(BUCKET, name)
-            item = parse_txt(text)
+            text = _download_text(name)
+            parsed = parse_txt(text)
 
-            # derive post_id if missing (fallback to digits in filename)
-            if not item.get("post_id"):
-                m = re.search(r"(\d{8,12})", name)
-                if m:
-                    item["post_id"] = m.group(1)
-
-            if not item.get("post_id"):
-                logging.warning(f"[extractor] no post_id for {name}; skipping")
-                done.add(name)
-                processed_now.append(name)
+            # derive url/post_id if missing
+            url = parsed.get("url") or parse_url_from_text(text)
+            post_id = parsed.get("post_id") or post_id_from_any(name, text, url)
+            if not post_id:
+                logging.warning(f"[extractor-cron] no post_id for {name}; skipping")
+                processed_state.add(name)
+                processed += 1
                 continue
 
-            # output path: craigslist/<run_id>/structured/json/<post_id>.json
-            parts = name.split("/")
-            run_prefix = "/".join(parts[:2])   # craigslist/<run_id>
-            out_key = f"{run_prefix}/structured/json/{item['post_id']}.json"
-            _write_json(BUCKET, out_key, item)
+            # call model to enrich/clean
+            raw = model_extract_json(text, url, post_id)
+
+            # merge: prefer model values when present (not None), fallback to parsed
+            merged = dict(parsed)
+            for k, v in raw.items():
+                if v is not None:
+                    merged[k] = v
+
+            merged["post_id"] = post_id
+            merged["url"] = merged.get("url") or url
+
+            # price fallback if still missing
+            if merged.get("price") is None:
+                pf = price_fallback(merged.get("title") or "", merged.get("body") or "")
+                if pf is not None:
+                    merged["price"] = pf
+
+            # ensure attrs_json is an object with list-able misc
+            if merged.get("attrs_json") is None:
+                merged["attrs_json"] = {}
+            _ensure_misc_list(merged["attrs_json"])
+
+            # validate
+            item = Listing(**merged)
+
+            # write JSON (overwrite allowed)
+            out_key = f"{PREFIX}/{run_id}/structured/json/{post_id}.json"
+            _upload_json(out_key, item.dict())
             written += 1
-            done.add(name)
-            processed_now.append(name)
+
+            # mark processed
+            processed_state.add(name)
+            processed += 1
 
         except Exception as e:
             errors += 1
-            logging.error(f"[extractor] failed {name}: {e}\n{traceback.format_exc()}")
-            # mark it processed so we don't loop forever; you can change this to retry logic if you want
-            done.add(name)
-            processed_now.append(name)
+            logging.error(f"[extractor-cron] failed {name}: {e}\n{traceback.format_exc()}")
+            # Do not mark processed -> it will retry on next cron unless overwrite=True was used
 
-    _write_state(BUCKET, STATE_KEY, done)
+    # Persist state
+    try:
+        _write_state(run_id, processed_state)
+    except Exception as e:
+        logging.error(f"[extractor-cron] failed to write state for run {run_id}: {e}")
 
-    result = {"processed": len(processed_now), "written_json": written, "errors": errors}
+    result = {
+        "ok": True,
+        "run_id": run_id,
+        "processed": processed,
+        "written_json": written,
+        "errors": errors
+    }
     logging.info(json.dumps(result))
     return jsonify(result), 200

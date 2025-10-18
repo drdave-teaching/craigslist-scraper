@@ -19,8 +19,8 @@ from flask import Request, jsonify
 from google.cloud import storage
 from google.api_core import retry as gax_retry
 
-import vertexai
-from vertexai.preview.generative_models import GenerativeModel, Part
+# import vertexai
+# from vertexai.preview.generative_models import GenerativeModel, Part
 
 from pydantic import BaseModel, Field, validator
 
@@ -91,12 +91,24 @@ def _write_state(run_id: str, processed: Set[str]):
 
 # -------------------- Vertex / schema --------------------
 
-def _model() -> GenerativeModel:
+def _model():
     global _MODEL
-    if _MODEL is None:
+    if _MODEL is not None:
+        return _MODEL
+    try:
+        import vertexai
+        # If you were using preview before, keep it. If not needed, you can use the GA path below.
+        from vertexai.preview.generative_models import GenerativeModel, Part
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         _MODEL = GenerativeModel("gemini-1.5-pro")
-    return _MODEL
+        # store Part on the function for reuse
+        _model.Part = Part  # type: ignore[attr-defined]
+        _model.GenerativeModel = GenerativeModel  # type: ignore[attr-defined]
+        return _MODEL
+    except ModuleNotFoundError as e:
+        # Library not installed → surface a clear error without killing the process
+        raise RuntimeError("vertexai_not_installed: add google-cloud-aiplatform to requirements.txt") from e
+
 
 class Listing(BaseModel):
     post_id: str
@@ -165,12 +177,13 @@ def model_extract_json(text: str, url: Optional[str], post_id: str) -> Dict:
         f"POST_ID: {post_id}\nURL: {url or ''}\n\nLISTING TEXT:\n{text}\n\nReturn ONLY JSON."
     )
     resp = _model().generate_content(
-        [Part.from_text(prompt)],
+        [_model.Part.from_text(prompt)],
         generation_config={
             "response_mime_type": "application/json",
             "response_schema": schema
         }
     )
+
     return json.loads(resp.text)
 
 # -------------------- Deterministic TXT parsing --------------------

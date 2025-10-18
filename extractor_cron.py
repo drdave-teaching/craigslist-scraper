@@ -272,14 +272,15 @@ def price_fallback(title: str, body: str) -> Optional[int]:
 def _list_run_ids() -> List[str]:
     # prefixes like 'craigslist/20251017T185944Z/'
     it = _sc().list_blobs(BUCKET, prefix=f"{PREFIX}/", delimiter="/")
-    # storage client exposes .prefixes on the iterator
+    # IMPORTANT: consume iterator so .prefixes gets populated
+    _ = list(it)
     run_ids = []
-    for p in getattr(it, "prefixes", []):
+    for p in sorted(getattr(it, "prefixes", [])):
         # p == 'craigslist/<run_id>/' → grab <run_id>
         parts = p.strip("/").split("/")
         if len(parts) == 2 and parts[0] == PREFIX:
             run_ids.append(parts[1])
-    return sorted(run_ids)
+    return run_ids
 
 def _list_txt_for_run(run_id: str) -> List[str]:
     pfx = f"{PREFIX}/{run_id}/txt/"

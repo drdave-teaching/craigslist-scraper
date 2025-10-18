@@ -1,3 +1,5 @@
-functions-framework==3.*
 google-cloud-storage>=2.16.0
-flask>=2.3.0
+google-api-core>=2.19.0
+Flask>=2.3
+pydantic>=1.10,<2        # you used pydantic v1-style validators
+google-cloud-aiplatform>=1.69.0

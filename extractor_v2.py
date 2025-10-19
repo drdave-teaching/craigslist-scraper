@@ -1,10 +1,7 @@
 import os, re, json, logging, traceback
 from flask import Request, jsonify
-from google.cloud import storage
 from google.api_core import retry as gax_retry
 from google.cloud import storage
-import os, re, json, logging, traceback
-
 
 # -------------------- ENV --------------------
 PROJECT_ID  = os.getenv("PROJECT_ID")
@@ -19,32 +16,23 @@ READ_RETRY = gax_retry.Retry(
 storage_client = storage.Client()
 
 # -------------------- SIMPLE REGEX --------------------
-PRICE_RE    = re.compile(r"\$\s?([0-9,]+)")
-YEAR_RE     = re.compile(r"\b(19|20)\d{2}\b")
-MILEAGE_RE  = re.compile(r"(\d{1,3}(?:,\d{3})+)\s*(?:mi|miles)\b", re.I)
-MAKE_MODEL_RE = re.compile(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)")
+PRICE_RE       = re.compile(r"\$\s?([0-9,]+)")
+YEAR_RE        = re.compile(r"\b(19|20)\d{2}\b")
+MAKE_MODEL_RE  = re.compile(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)")
 
 # -------------------- HELPERS --------------------
 def _list_run_ids(bucket: str, prefix: str) -> list[str]:
     """Return sorted run_ids under gs://bucket/prefix/<run_id>/"""
-    client = storage.Client()
-    it = client.list_blobs(bucket, prefix=f"{prefix}/", delimiter="/")
-    _ = list(it)  # IMPORTANT: forces it.prefixes to populate
+    it = storage_client.list_blobs(bucket, prefix=f"{prefix}/", delimiter="/")
+    # Force one iteration so it.prefixes is populated
+    for _ in it:
+        pass
     run_ids = []
     for p in sorted(getattr(it, "prefixes", [])):
         parts = p.strip("/").split("/")
         if len(parts) == 2 and parts[0] == prefix:
             run_ids.append(parts[1])
     return run_ids
-
-# In extract_http(), after parsing body:
-run_id = body.get("run_id")
-if not run_id:
-    runs = _list_run_ids(BUCKET_NAME, PREFIX)
-    if not runs:
-        return jsonify({"ok": False, "error": "no runs found"}), 200
-    run_id = runs[-1]  # newest
-
 
 def list_txt_for_run(run_id: str):
     prefix = f"{PREFIX}/{run_id}/txt/"
@@ -82,34 +70,34 @@ def parse_listing(text: str) -> dict:
         d["make"] = mm.group(1)
         d["model"] = mm.group(2)
 
-    # mileage: capture values like "Mileage: 144700", "144,700 miles", "120k mi", or "odometer: 95000"
+    # mileage: handle "Mileage: 144700", "odometer: 95,000", "120k miles", "144,700 miles"
     mi = None
 
-    # 1️⃣ direct field form (Mileage: 144700, Odometer: 95000)
+    # (1) direct field
     m1 = re.search(r"(?:mileage|odometer)\s*[:\-]?\s*([\d,]+)", text, re.I)
     if m1:
         try:
             mi = int(m1.group(1).replace(",", ""))
         except ValueError:
-            pass
+            mi = None
 
-    # 2️⃣ shorthand form (e.g., "120k miles")
+    # (2) shorthand "k"
     if mi is None:
         m2 = re.search(r"(\d+(?:\.\d+)?)\s*k\s*(?:mi|mile|miles)\b", text, re.I)
         if m2:
             try:
                 mi = int(float(m2.group(1)) * 1000)
             except ValueError:
-                pass
+                mi = None
 
-    # 3️⃣ plain numeric form followed by "miles" or "mi"
+    # (3) plain numeric followed by miles/mi
     if mi is None:
         m3 = re.search(r"(\d{1,3}(?:[,\d]{3})*)\s*(?:mi|mile|miles)\b", text, re.I)
         if m3:
             try:
                 mi = int(re.sub(r"[^\d]", "", m3.group(1)))
             except ValueError:
-                pass
+                mi = None
 
     if mi is not None:
         d["mileage"] = mi
@@ -119,16 +107,31 @@ def parse_listing(text: str) -> dict:
 # -------------------- HTTP ENTRY --------------------
 def extract_http(request: Request):
     logging.getLogger().setLevel(logging.INFO)
+
+    if not BUCKET_NAME:
+        return jsonify({"ok": False, "error": "missing GCS_BUCKET env"}), 500
+
     try:
         body = request.get_json(silent=True) or {}
     except Exception:
         body = {}
 
-    run_id = body.get("run_id")
+    # Request options
+    run_id    = body.get("run_id")
+    max_files = int(body.get("max_files") or 0)   # 0 = no limit
+    overwrite = bool(body.get("overwrite") or False)  # kept for future use, not used here
+
+    # If run_id not provided, pick newest
     if not run_id:
-        return jsonify({"ok": False, "error": "missing run_id"}), 400
+        runs = _list_run_ids(BUCKET_NAME, PREFIX)
+        if not runs:
+            return jsonify({"ok": False, "error": "no runs found under prefix", "prefix": PREFIX}), 200
+        run_id = runs[-1]
 
     txt_blobs = list_txt_for_run(run_id)
+    if max_files > 0:
+        txt_blobs = txt_blobs[:max_files]
+
     processed, written, errors = 0, 0, 0
 
     for name in txt_blobs:
@@ -138,12 +141,11 @@ def extract_http(request: Request):
             fields["source_txt"] = name
 
             # derive post_id directly from the txt filename
-            txt_filename = os.path.basename(name)              # e.g. "123456789.txt"
-            post_id = os.path.splitext(txt_filename)[0]         # e.g. "123456789"
+            txt_filename = os.path.basename(name)       # e.g. "123456789.txt"
+            post_id = os.path.splitext(txt_filename)[0] # e.g. "123456789"
             fields["post_id"] = post_id
 
-
-            out_key = f"{PREFIX}/{run_id}/structured/json2/{fields['post_id']}.json"
+            out_key = f"{PREFIX}/{run_id}/structured/json2/{post_id}.json"
             upload_json(out_key, fields)
             written += 1
         except Exception as e:

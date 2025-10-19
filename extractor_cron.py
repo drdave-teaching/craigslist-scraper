@@ -18,10 +18,6 @@ from typing import Optional, List, Dict, Set
 from flask import Request, jsonify
 from google.cloud import storage
 from google.api_core import retry as gax_retry
-
-# import vertexai
-# from vertexai.preview.generative_models import GenerativeModel, Part
-
 from pydantic import BaseModel, Field, validator
 
 # -------------------- Config / Env --------------------
@@ -91,23 +87,28 @@ def _write_state(run_id: str, processed: Set[str]):
 
 # -------------------- Vertex / schema --------------------
 
+USE_VERTEX = os.getenv("USE_VERTEX", "1") == "1"
+
 def _model():
+    """Lazy Vertex init; only when called and only if USE_VERTEX=1."""
     global _MODEL
     if _MODEL is not None:
         return _MODEL
+    if not USE_VERTEX:
+        raise RuntimeError("vertex_disabled")
+
     try:
-        import vertexai
-        # If you were using preview before, keep it. If not needed, you can use the GA path below.
+        import vertexai  # provided by google-cloud-aiplatform
         from vertexai.preview.generative_models import GenerativeModel, Part
         vertexai.init(project=PROJECT_ID, location=LOCATION)
         _MODEL = GenerativeModel("gemini-1.5-pro")
-        # store Part on the function for reuse
-        _model.Part = Part  # type: ignore[attr-defined]
-        _model.GenerativeModel = GenerativeModel  # type: ignore[attr-defined]
+        _model.Part = Part  # stash for callers
         return _MODEL
     except ModuleNotFoundError as e:
-        # Library not installed → surface a clear error without killing the process
-        raise RuntimeError("vertexai_not_installed: add google-cloud-aiplatform to requirements.txt") from e
+        raise RuntimeError(
+            "vertexai_not_installed: add google-cloud-aiplatform to requirements.txt"
+        ) from e
+
 
 
 class Listing(BaseModel):
@@ -176,6 +177,7 @@ def model_extract_json(text: str, url: Optional[str], post_id: str) -> Dict:
         f"{system}\n\n{fewshot}\n"
         f"POST_ID: {post_id}\nURL: {url or ''}\n\nLISTING TEXT:\n{text}\n\nReturn ONLY JSON."
     )
+    
     resp = _model().generate_content(
         [_model.Part.from_text(prompt)],
         generation_config={
@@ -183,6 +185,7 @@ def model_extract_json(text: str, url: Optional[str], post_id: str) -> Dict:
             "response_schema": schema
         }
     )
+
 
     return json.loads(resp.text)
 
@@ -361,7 +364,14 @@ def extract_http(request: Request):
                 continue
 
             # call model to enrich/clean
-            raw = model_extract_json(text, url, post_id)
+            raw = {}
+            if USE_VERTEX:
+                try:
+                    raw = model_extract_json(text, url, post_id)
+                except Exception as e:
+                    logging.error(f"[extractor-cron] Vertex extract failed for {name}: {e}")
+                    raw = {}
+
 
             # merge: prefer model values when present (not None), fallback to parsed
             merged = dict(parsed)

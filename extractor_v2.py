@@ -86,12 +86,11 @@ def extract_http(request: Request):
             fields = parse_listing(text)
             fields["source_txt"] = name
 
-            # derive post_id from filename
-            post_id = re.search(r"(\d{6,12})", name)
-            if post_id:
-                fields["post_id"] = post_id.group(1)
-            else:
-                fields["post_id"] = os.path.basename(name)
+            # derive post_id directly from the txt filename
+            txt_filename = os.path.basename(name)              # e.g. "123456789.txt"
+            post_id = os.path.splitext(txt_filename)[0]         # e.g. "123456789"
+            fields["post_id"] = post_id
+
 
             out_key = f"{PREFIX}/{run_id}/structured/json2/{fields['post_id']}.json"
             upload_json(out_key, fields)

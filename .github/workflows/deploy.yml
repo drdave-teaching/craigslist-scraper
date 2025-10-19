@@ -32,10 +32,15 @@ env:
   REQUEST_DELAY_SECS: '1.0'
   DETAIL_REQUEST_DELAY_SECS: '1.0'
 
-  # scheduler config
-  SCHEDULER_JOB_ID: craigslist-scraper-6h
-  CRON: '0 */6 * * *'                      # every 6 hours
-  TIMEZONE: 'America/New_York'
+  # # scheduler config
+  # SCHEDULER_JOB_ID: craigslist-scraper-6h
+  # CRON: '0 */6 * * *'                      # every 6 hours
+  # TIMEZONE: 'America/New_York'
+
+  SCHEDULER_JOB_ID: craigslist-scraper-hourly
+  CRON: '0 * * * *'               # every hour
+  TIMEZONE: 'America/New_York'    # keep this
+
 
 jobs:
   deploy:

@@ -15,16 +15,16 @@ permissions:
 
 env:
   PROJECT_ID: ${{ vars.PROJECT_ID }}
-  REGION: ${{ vars.REGION }}
+  REGION: ${{ vars.REGION }}                # e.g., us-central1
   WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
-  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
-  RUNTIME_SA: ${{ vars.RUNTIME_SA }}
-  SCHEDULER_SA: ${{ vars.SCHEDULER_SA }}   # ✅ added
+  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}      # SA with deploy perms
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}        # SA the function runs as (has Storage + Vertex perms)
+  SCHEDULER_SA: ${{ vars.SCHEDULER_SA }}    # SA used by Cloud Scheduler to invoke function
   GCS_BUCKET: ${{ vars.GCS_BUCKET }}
   OUTPUT_PREFIX: craigslist
   FUNCTION_NAME: extractor-cron
-  JOB_ID: extractor-cron-5m
-  CRON: '*/5 * * * *'
+  JOB_ID: extract-hourly                     # hourly job id
+  CRON: '0 * * * *'                          # hourly
   TIMEZONE: 'America/New_York'
 
 jobs:
@@ -41,13 +41,14 @@ jobs:
 
       - uses: google-github-actions/setup-gcloud@v2
 
-      - name: Enable required services (idempotent)   # ✅ added
+      - name: Enable required services (idempotent)
         run: |
           gcloud services enable \
             cloudfunctions.googleapis.com \
             run.googleapis.com \
             artifactregistry.googleapis.com \
-            cloudscheduler.googleapis.com
+            cloudscheduler.googleapis.com \
+            aiplatform.googleapis.com
 
       - name: Stage src
         run: |
@@ -56,28 +57,27 @@ jobs:
           cp extractor_cron.py cron_src/main.py
           cp requirements_extractor_cron.txt cron_src/requirements.txt
 
-      - name: Deploy function
+      - name: Deploy function (Gen2, py312, 1Gi, 540s, Vertex OFF)
         run: |
           gcloud functions deploy "$FUNCTION_NAME" \
-            --gen2 --region="${{ env.REGION }}" --runtime=python311 \
-            --entry-point=extract_http --trigger-http \
+            --gen2 \
+            --region="${{ env.REGION }}" \
+            --runtime=python312 \
+            --entry-point=extract_http \
+            --trigger-http \
             --service-account="${{ env.RUNTIME_SA }}" \
-            --no-allow-unauthenticated --timeout=300s --memory=512Mi \
+            --no-allow-unauthenticated \
+            --timeout=540s \
+            --memory=1Gi \
+            --max-instances=1 \
             --source=./cron_src \
-            --set-env-vars="GCS_BUCKET=${{ env.GCS_BUCKET }},OUTPUT_PREFIX=${{ env.OUTPUT_PREFIX }}"
+            --set-env-vars="PROJECT_ID=${{ env.PROJECT_ID }},LOCATION=${{ env.REGION }},GCS_BUCKET=${{ env.GCS_BUCKET }},OUTPUT_PREFIX=${{ env.OUTPUT_PREFIX }},LOG_EXECUTION_ID=true,USE_VERTEX=0"
 
       - name: Get URL
         id: fn
         run: |
           URL="$(gcloud functions describe "$FUNCTION_NAME" --region="${{ env.REGION }}" --format='value(serviceConfig.uri)')"
-          echo "FUNCTION_URL=$URL"
           echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
-
-      - name: Grant Scheduler admin to Deployer SA (idempotent)
-        run: |
-          gcloud projects add-iam-policy-binding "${{ env.PROJECT_ID }}" \
-            --member="serviceAccount:${{ env.DEPLOYER_SA }}" \
-            --role="roles/cloudscheduler.admin" || true
 
       - name: Allow Scheduler SA to invoke
         run: |
@@ -85,28 +85,11 @@ jobs:
             --region="${{ env.REGION }}" \
             --member="serviceAccount:${{ env.SCHEDULER_SA }}" \
             --role="roles/run.invoker" || true
-      
 
-      - name: Create/Update 5-min scheduler
+      - name: Create/Update hourly scheduler
         run: |
           set -euo pipefail
-
-          JOB_EXISTS="$(gcloud scheduler jobs describe "$JOB_ID" --location="${{ env.REGION }}" --format='value(name)' || true)"
-
-          if [[ -z "$JOB_EXISTS" ]]; then
-            echo "Creating scheduler job $JOB_ID..."
-            gcloud scheduler jobs create http "$JOB_ID" \
-              --location="${{ env.REGION }}" \
-              --schedule="${{ env.CRON }}" \
-              --time-zone="${{ env.TIMEZONE }}" \
-              --http-method=POST \
-              --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
-              --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
-              --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
-              --headers="Content-Type=application/json" \
-              --message-body='{}'
-          else
-            echo "Updating scheduler job $JOB_ID..."
+          if gcloud scheduler jobs describe "$JOB_ID" --location="${{ env.REGION }}" >/dev/null 2>&1; then
             gcloud scheduler jobs update http "$JOB_ID" \
               --location="${{ env.REGION }}" \
               --schedule="${{ env.CRON }}" \
@@ -116,6 +99,16 @@ jobs:
               --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
               --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
               --update-headers="Content-Type=application/json" \
-              --message-body='{}'
+              --message-body='{"max_files":200,"overwrite":false}'
+          else
+            gcloud scheduler jobs create http "$JOB_ID" \
+              --location="${{ env.REGION }}" \
+              --schedule="${{ env.CRON }}" \
+              --time-zone="${{ env.TIMEZONE }}" \
+              --http-method=POST \
+              --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --oidc-service-account-email="${{ env.SCHEDULER_SA }}" \
+              --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --headers="Content-Type=application/json" \
+              --message-body='{"max_files":200,"overwrite":false}'
           fi
-

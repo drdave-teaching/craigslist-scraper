@@ -174,6 +174,17 @@ def gcs_blob_exists(bucket: str, path: str) -> bool:
     b = storage_client().bucket(bucket)
     return b.blob(path).exists()
 
+def listing_already_processed(bucket: str, post_id: str) -> bool:
+    """Check if this post_id already exists in any previous run's json2 folder."""
+    b = storage_client().bucket(bucket)
+    # We list all possible paths matching the json2 output structure
+    prefix = f"{OUTPUT_PREFIX}/"
+    blobs = b.list_blobs(prefix=prefix)
+    for blob in blobs:
+        if blob.name.endswith(f"/structured/json2/{post_id}.json"):
+            return True
+    return False
+
 
 # ------------- Core scrape -------------
 def scrape(max_pages: int) -> pd.DataFrame:
@@ -248,6 +259,12 @@ def scrape_http(request: Request):
     for _, row in df.iterrows():
         url = row.get("url")
         if not url:
+            skipped += 1
+            continue
+        # derive post_id for duplication check
+        pid = extract_post_id(url)
+        if pid and listing_already_processed(GCS_BUCKET, pid):
+            print(f"[dup] Skipping {pid} (already processed)", file=sys.stderr)
             skipped += 1
             continue
         html = fetch_html(url)

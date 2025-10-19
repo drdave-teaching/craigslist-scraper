@@ -58,10 +58,37 @@ def parse_listing(text: str) -> dict:
         d["make"] = mm.group(1)
         d["model"] = mm.group(2)
 
-    # mileage
-    mi = MILEAGE_RE.search(text)
-    if mi:
-        d["mileage"] = int(mi.group(1).replace(",", ""))
+    # mileage: capture values like "Mileage: 144700", "144,700 miles", "120k mi", or "odometer: 95000"
+    mi = None
+
+    # 1️⃣ direct field form (Mileage: 144700, Odometer: 95000)
+    m1 = re.search(r"(?:mileage|odometer)\s*[:\-]?\s*([\d,]+)", text, re.I)
+    if m1:
+        try:
+            mi = int(m1.group(1).replace(",", ""))
+        except ValueError:
+            pass
+
+    # 2️⃣ shorthand form (e.g., "120k miles")
+    if mi is None:
+        m2 = re.search(r"(\d+(?:\.\d+)?)\s*k\s*(?:mi|mile|miles)\b", text, re.I)
+        if m2:
+            try:
+                mi = int(float(m2.group(1)) * 1000)
+            except ValueError:
+                pass
+
+    # 3️⃣ plain numeric form followed by "miles" or "mi"
+    if mi is None:
+        m3 = re.search(r"(\d{1,3}(?:[,\d]{3})*)\s*(?:mi|mile|miles)\b", text, re.I)
+        if m3:
+            try:
+                mi = int(re.sub(r"[^\d]", "", m3.group(1)))
+            except ValueError:
+                pass
+
+    if mi is not None:
+        d["mileage"] = mi
 
     return d
 

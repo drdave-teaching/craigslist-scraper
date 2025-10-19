@@ -112,5 +112,5 @@ jobs:
               --oidc-service-account-email="${{ env.RUNTIME_SA }}" \
               --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
               --headers="Content-Type=application/json" \
-              --message-body='{"run_id":"20251017T185944Z"}'
+              --message-body='{}'
           fi

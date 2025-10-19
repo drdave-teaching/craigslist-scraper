@@ -2,6 +2,9 @@ import os, re, json, logging, traceback
 from flask import Request, jsonify
 from google.cloud import storage
 from google.api_core import retry as gax_retry
+from google.cloud import storage
+import os, re, json, logging, traceback
+
 
 # -------------------- ENV --------------------
 PROJECT_ID  = os.getenv("PROJECT_ID")
@@ -22,6 +25,27 @@ MILEAGE_RE  = re.compile(r"(\d{1,3}(?:,\d{3})+)\s*(?:mi|miles)\b", re.I)
 MAKE_MODEL_RE = re.compile(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)")
 
 # -------------------- HELPERS --------------------
+def _list_run_ids(bucket: str, prefix: str) -> list[str]:
+    """Return sorted run_ids under gs://bucket/prefix/<run_id>/"""
+    client = storage.Client()
+    it = client.list_blobs(bucket, prefix=f"{prefix}/", delimiter="/")
+    _ = list(it)  # IMPORTANT: forces it.prefixes to populate
+    run_ids = []
+    for p in sorted(getattr(it, "prefixes", [])):
+        parts = p.strip("/").split("/")
+        if len(parts) == 2 and parts[0] == prefix:
+            run_ids.append(parts[1])
+    return run_ids
+
+# In extract_http(), after parsing body:
+run_id = body.get("run_id")
+if not run_id:
+    runs = _list_run_ids(BUCKET_NAME, PREFIX)
+    if not runs:
+        return jsonify({"ok": False, "error": "no runs found"}), 200
+    run_id = runs[-1]  # newest
+
+
 def list_txt_for_run(run_id: str):
     prefix = f"{PREFIX}/{run_id}/txt/"
     bucket = storage_client.bucket(BUCKET_NAME)

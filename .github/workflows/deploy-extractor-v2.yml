@@ -22,8 +22,8 @@ env:
   GCS_BUCKET: ${{ vars.GCS_BUCKET }}
   OUTPUT_PREFIX: craigslist
   FUNCTION_NAME: extractor-v2
-  JOB_ID: extractor-v2-hourly
-  CRON: '0 * * * *'
+  JOB_ID: extractor-v2-6h
+  CRON: '0 */6 * * *'          # every 6 hours
   TIMEZONE: 'America/New_York'
 
 jobs:

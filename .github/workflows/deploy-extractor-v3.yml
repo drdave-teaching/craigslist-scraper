@@ -1,0 +1,125 @@
+name: Deploy — Extractor v3 (JSONL, Gen2)
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'extractor_v3_jsonl.py'
+      - 'requirements_extractor_v3.txt'
+      - '.github/workflows/deploy-extractor-v3.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+env:
+  PROJECT_ID: ${{ vars.PROJECT_ID }}
+  REGION: ${{ vars.REGION }}
+  WORKLOAD_IDENTITY_PROVIDER: ${{ vars.WORKLOAD_IDENTITY_PROVIDER }}
+  DEPLOYER_SA: ${{ vars.DEPLOYER_SA }}
+  RUNTIME_SA: ${{ vars.RUNTIME_SA }}
+  GCS_BUCKET: ${{ vars.GCS_BUCKET }}
+  OUTPUT_PREFIX: craigslist
+
+  FUNCTION_NAME: extractor-v3-jsonl
+  JOB_ID: extractor-v3-hourly
+  CRON: '15 * * * *'           # 15 min after the hour
+  TIMEZONE: 'America/New_York'
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ env.DEPLOYER_SA }}
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Enable required services
+        run: |
+          gcloud services enable \
+            cloudfunctions.googleapis.com \
+            run.googleapis.com \
+            artifactregistry.googleapis.com \
+            cloudscheduler.googleapis.com
+
+      # Package the function into an isolated folder
+      - name: Stage src
+        run: |
+          rm -rf cron_src
+          mkdir -p cron_src
+          cp extractor_v3_jsonl.py cron_src/main.py
+          # Use a v3 requirements file if you have it; else point to your v2 one.
+          if [ -f requirements_extractor_v3.txt ]; then
+            cp requirements_extractor_v3.txt cron_src/requirements.txt
+          else
+            cp requirements_extractor_v2.txt cron_src/requirements.txt
+          fi
+
+      - name: Deploy Cloud Function (Gen2, Python 3.12)
+        run: |
+          gcloud functions deploy "$FUNCTION_NAME" \
+            --gen2 \
+            --region="${{ env.REGION }}" \
+            --runtime=python312 \
+            --entry-point=extract_http \
+            --trigger-http \
+            --service-account="${{ env.RUNTIME_SA }}" \
+            --no-allow-unauthenticated \
+            --timeout=300s \
+            --memory=512Mi \
+            --max-instances=1 \
+            --source=./cron_src \
+            --set-env-vars="PROJECT_ID=${{ env.PROJECT_ID }},GCS_BUCKET=${{ env.GCS_BUCKET }},OUTPUT_PREFIX=${{ env.OUTPUT_PREFIX }}"
+
+      - name: Get function URL
+        id: fn
+        run: |
+          URL="$(gcloud functions describe "$FUNCTION_NAME" --region="${{ env.REGION }}" --format='value(serviceConfig.uri)')"
+          echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
+          echo "Function URL: $URL"
+
+      # Give the invoking SA (RUNTIME_SA) permission to call the function
+      - name: Allow invocations from runtime SA
+        run: |
+          gcloud run services add-iam-policy-binding "$FUNCTION_NAME" \
+            --region="${{ env.REGION }}" \
+            --member="serviceAccount:${{ env.RUNTIME_SA }}" \
+            --role="roles/run.invoker" || true
+
+      # Create or update the Cloud Scheduler job that calls the function at :15
+      - name: Create/Update hourly scheduler
+        run: |
+          set -euo pipefail
+          if gcloud scheduler jobs describe "$JOB_ID" --location="${{ env.REGION }}" >/dev/null 2>&1; then
+            gcloud scheduler jobs update http "$JOB_ID" \
+              --location="${{ env.REGION }}" \
+              --schedule="${{ env.CRON }}" \
+              --time-zone="${{ env.TIMEZONE }}" \
+              --http-method=POST \
+              --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --oidc-service-account-email="${{ env.RUNTIME_SA }}" \
+              --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --update-headers="Content-Type=application/json" \
+              --message-body='{}'
+          else
+            gcloud scheduler jobs create http "$JOB_ID" \
+              --location="${{ env.REGION }}" \
+              --schedule="${{ env.CRON }}" \
+              --time-zone="${{ env.TIMEZONE }}" \
+              --http-method=POST \
+              --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --oidc-service-account-email="${{ env.RUNTIME_SA }}" \
+              --oidc-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
+              --headers="Content-Type=application/json" \
+              --message-body='{}'
+          fi

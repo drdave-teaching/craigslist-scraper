@@ -285,34 +285,37 @@ def scrape_http(request: Request):
     # detail pages → one TXT per listing
     saved, skipped = 0, 0
     txt_prefix = base_prefix / "txt"
+    region_key = craigslist_region_from_base(BASE_SITE)
+
     for _, row in df.iterrows():
         url = row.get("url")
         if not url:
             skipped += 1
             continue
-        # derive post_id and check a GLOBAL seen-sentinel before fetching detail
+
+        # Derive post_id
         pid = extract_post_id(url)
-        region_key = craigslist_region_from_base(BASE_SITE)
         if not pid:
             skipped += 1
             continue
 
+        # ---- DEDUPE (non-destructive before fetch) ----
         sentinel_key = f"{OUTPUT_PREFIX}/_seen/{region_key}/{pid}"
-        is_new = gcs_create_sentinel_if_absent(GCS_BUCKET, sentinel_key)
-        if not is_new:
-            print(f"[dup] Skipping {pid} (already seen via sentinel)", file=sys.stderr)
+        # If sentinel already exists, we've processed this post before → skip
+        if storage_client().bucket(GCS_BUCKET).blob(sentinel_key).exists():
+            print(f"[dup] Skipping {pid} (sentinel exists)", file=sys.stderr)
             skipped += 1
             continue
 
-        # Only fetch the detail page if this is truly new
+        # Fetch detail page only for truly new posts
         html = fetch_html(url)
-
         if not html:
             skipped += 1
             continue
+
         detail = parse_detail_page(html)
 
-        # assemble the .txt content
+        # Assemble the .txt content
         lines = []
         lines.append(f"Title: {row.get('title') or ''}")
         price = row.get("price")
@@ -338,9 +341,17 @@ def scrape_http(request: Request):
         if gcs_blob_exists(GCS_BUCKET, obj_name):
             skipped += 1
             continue
-        
+
+        # Write TXT
         gcs_upload_text(GCS_BUCKET, obj_name, text, content_type="text/plain")
         saved += 1
+
+        # ---- ONLY NOW: lock in the sentinel (idempotent) ----
+        try:
+            gcs_create_sentinel_if_absent(GCS_BUCKET, sentinel_key)
+        except Exception as e:
+            # Not fatal; just log
+            print(f"[warn] failed to create sentinel for {pid}: {e}", file=sys.stderr)
 
         time.sleep(DETAIL_REQUEST_DELAY_SECS)
 

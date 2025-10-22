@@ -15,6 +15,10 @@ import pandas as pd
 from google.cloud import storage
 from flask import Request, jsonify
 
+from urllib.parse import urlparse
+from google.api_core.exceptions import PreconditionFailed
+
+
 # ---------------- CONFIG (env-first) ----------------
 BASE_SITE = os.getenv("BASE_SITE", "https://newhaven.craigslist.org")
 SEARCH_PATH = os.getenv("SEARCH_PATH", "/search/cta")
@@ -185,6 +189,31 @@ def listing_already_processed(bucket: str, post_id: str) -> bool:
             return True
     return False
 
+def craigslist_region_from_base(base_site: str) -> str:
+    """
+    Derive region key from BASE_SITE, e.g., https://newhaven.craigslist.org -> 'newhaven'.
+    """
+    try:
+        host = urlparse(base_site).hostname or ""
+        if host.endswith(".craigslist.org"):
+            return host.split(".")[0]
+        return host.split(".")[0] or "unknown"
+    except Exception:
+        return "unknown"
+
+def gcs_create_sentinel_if_absent(bucket: str, key: str) -> bool:
+    """
+    Atomically create a zero-byte sentinel object if it does NOT exist.
+    Returns True if created (i.e., this post_id is NEW), False if it already exists.
+    """
+    b = storage_client().bucket(bucket)
+    blob = b.blob(key)
+    try:
+        blob.upload_from_string(b"", content_type="application/octet-stream", if_generation_match=0)
+        return True
+    except PreconditionFailed:
+        return False
+
 
 # ------------- Core scrape -------------
 def scrape(max_pages: int) -> pd.DataFrame:
@@ -261,13 +290,23 @@ def scrape_http(request: Request):
         if not url:
             skipped += 1
             continue
-        # derive post_id for duplication check
+        # derive post_id and check a GLOBAL seen-sentinel before fetching detail
         pid = extract_post_id(url)
-        if pid and listing_already_processed(GCS_BUCKET, pid):
-            print(f"[dup] Skipping {pid} (already processed)", file=sys.stderr)
+        region_key = craigslist_region_from_base(BASE_SITE)
+        if not pid:
             skipped += 1
             continue
+
+        sentinel_key = f"{OUTPUT_PREFIX}/_seen/{region_key}/{pid}"
+        is_new = gcs_create_sentinel_if_absent(GCS_BUCKET, sentinel_key)
+        if not is_new:
+            print(f"[dup] Skipping {pid} (already seen via sentinel)", file=sys.stderr)
+            skipped += 1
+            continue
+
+        # Only fetch the detail page if this is truly new
         html = fetch_html(url)
+
         if not html:
             skipped += 1
             continue

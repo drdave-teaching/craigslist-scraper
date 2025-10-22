@@ -87,30 +87,39 @@ jobs:
           URL="$(gcloud functions describe "$FUNCTION_NAME" --region="$REGION" --format='value(serviceConfig.uri)')"
           echo "FUNCTION_URL=$URL" >> "$GITHUB_OUTPUT"
 
-      - name: Create/Update Cloud Scheduler job (OIDC)
+      - name: Create/Update hourly scheduler (OIDC)
+        env:
+          URL: ${{ steps.fn.outputs.FUNCTION_URL }}   # comes from your "Get URL" step
         run: |
           set -euo pipefail
-          # try create, else update
-          gcloud scheduler jobs create http "$SCHEDULER_JOB_ID" \
-            --location="$REGION" \
-            --schedule="$CRON" \
-            --time-zone="$TIMEZONE" \
-            --http-method=POST \
-            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --oauth-service-account-email="$SCHEDULER_SA" \
-            --oauth-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --headers="Content-Type=application/json" \
-            --message-body='{"max_pages": 3, "prefix": "craigslist"}' \
-          || gcloud scheduler jobs update http "$SCHEDULER_JOB_ID" \
-            --location="$REGION" \
-            --schedule="$CRON" \
-            --time-zone="$TIMEZONE" \
-            --http-method=POST \
-            --uri="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --oauth-service-account-email="$SCHEDULER_SA" \
-            --oauth-token-audience="${{ steps.fn.outputs.FUNCTION_URL }}" \
-            --headers="Content-Type=application/json" \
-            --message-body='{"max_pages": 3, "prefix": "craigslist"}'
+          JOB_ID="${SCHEDULER_JOB_ID}"
+      
+          if gcloud scheduler jobs describe "$JOB_ID" --location="$REGION" >/dev/null 2>&1; then
+            echo "[scheduler] updating $JOB_ID"
+            gcloud scheduler jobs update http "$JOB_ID" \
+              --location="$REGION" \
+              --schedule="$CRON" \
+              --time-zone="$TIMEZONE" \
+              --http-method=POST \
+              --uri="$URL" \
+              --oidc-service-account-email="$SCHEDULER_SA" \
+              --oidc-token-audience="$URL" \
+              --update-headers="Content-Type=application/json" \
+              --message-body='{"max_pages": 3, "prefix": "craigslist"}'
+          else
+            echo "[scheduler] creating $JOB_ID"
+            gcloud scheduler jobs create http "$JOB_ID" \
+              --location="$REGION" \
+              --schedule="$CRON" \
+              --time-zone="$TIMEZONE" \
+              --http-method=POST \
+              --uri="$URL" \
+              --oidc-service-account-email="$SCHEDULER_SA" \
+              --oidc-token-audience="$URL" \
+              --headers="Content-Type=application/json" \
+              --message-body='{"max_pages": 3, "prefix": "craigslist"}'
+          fi
+
 
       - name: Done
         run: |

@@ -15,6 +15,7 @@ from google.cloud import storage
 PROJECT_ID  = os.getenv("PROJECT_ID")
 BUCKET_NAME = os.getenv("GCS_BUCKET")
 PREFIX      = os.getenv("OUTPUT_PREFIX", "craigslist")   # e.g., "craigslist"
+RUN_ID_RE = re.compile(r"^\d{8}T\d{6}Z$")
 
 READ_RETRY = gax_retry.Retry(
     predicate=gax_retry.if_transient_error,
@@ -30,17 +31,19 @@ MAKE_MODEL_RE  = re.compile(r"\b([A-Z][a-z]+)\s+([A-Z][A-Za-z0-9]+)")
 
 # -------------------- HELPERS --------------------
 def _list_run_ids(bucket: str, prefix: str) -> list[str]:
-    """Return sorted run_ids under gs://bucket/prefix/<run_id>/"""
+    """Return sorted run_ids under gs://bucket/prefix/<run_id>/ that look like 20250101T123000Z."""
     it = storage_client.list_blobs(bucket, prefix=f"{prefix}/", delimiter="/")
-    # Force an iteration so it.prefixes is populated
     for _ in it:
-        pass
+        pass  # populate it.prefixes
     run_ids = []
-    for p in sorted(getattr(it, "prefixes", [])):
+    for p in getattr(it, "prefixes", []):
         parts = p.strip("/").split("/")
         if len(parts) == 2 and parts[0] == prefix:
-            run_ids.append(parts[1])
-    return run_ids
+            cand = parts[1]
+            if RUN_ID_RE.match(cand):       # <-- exclude _seen and anything not a timestamp
+                run_ids.append(cand)
+    return sorted(run_ids)
+
 
 def list_txt_for_run(run_id: str):
     prefix = f"{PREFIX}/{run_id}/txt/"

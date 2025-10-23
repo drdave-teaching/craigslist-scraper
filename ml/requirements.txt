@@ -1,0 +1,6 @@
+pandas
+scikit-learn
+google-cloud-bigquery
+google-cloud-bigquery-storage
+pyarrow
+pandas-gbq

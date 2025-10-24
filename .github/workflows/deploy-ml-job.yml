@@ -1,0 +1,48 @@
+name: Build & Deploy sklearn-daily
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'ml/**'
+  workflow_dispatch: {}   # allow manual run
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write   # for Workload Identity Federation
+    env:
+      PROJECT_ID: craigslist-scraper-v2
+      REGION: us-central1
+      IMAGE: gcr.io/craigslist-scraper-v2/sklearn-daily:latest
+      JOB_NAME: sklearn-daily
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Auth to GCP (recommended: Workload Identity Federation)
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+
+      - name: Configure Docker auth
+        run: gcloud auth configure-docker --quiet
+
+      - name: Build & push image
+        working-directory: ml
+        run: |
+          docker build -t "$IMAGE" .
+          docker push "$IMAGE"
+
+      - name: Update Cloud Run Job to new image
+        run: |
+          gcloud run jobs update "$JOB_NAME" \
+            --region "$REGION" \
+            --image "$IMAGE"

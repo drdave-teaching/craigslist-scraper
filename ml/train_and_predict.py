@@ -9,7 +9,7 @@ PREDICT_SQL = os.environ["PREDICT_SQL"]   # today rows
 PREDS_TABLE = os.environ["PREDS_TABLE"]   # e.g. project.dataset.todays_car_preds
 TARGET      = os.environ.get("TARGET", "price")
 
-bq = bigquery.Client(project=PROJECT_ID, location=BQ_LOCATION)
+bq = bigquery.Client(project=PROJECT_ID)
 
 def read(sql):
     return bq.query(sql).result().to_dataframe(create_bqstorage_client=True)
@@ -41,9 +41,17 @@ out = pd.DataFrame({
     "pred_price": preds
 })
 # helpful breadcrumbs
+out = pd.DataFrame({
+    "post_id": today["post_id"],
+    "scraped_ts": today.get("scraped_ts"),
+    "scrape_date": today.get("scrape_date"),
+    "actual_price": today.get("price"),
+    "pred_price": preds,
+})
+
+if "price" in today.columns:
+    out["abs_error"] = (out["pred_price"] - out["actual_price"]).abs()
+    out["pct_error"] = (out["pred_price"] - out["actual_price"]) / out["actual_price"]
+
 out["model_name"] = "rf_baseline"
 out["model_run_ts"] = pd.Timestamp.utcnow()
-
-print(f"→ writing {len(out)} rows to {PREDS_TABLE} (replace)…")
-out.to_gbq(PREDS_TABLE, project_id=PROJECT_ID, if_exists="replace")
-print("✓ done")

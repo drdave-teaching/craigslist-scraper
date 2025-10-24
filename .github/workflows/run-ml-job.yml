@@ -1,0 +1,28 @@
+name: Run sklearn-daily
+
+on:
+  workflow_dispatch: {}      # click "Run workflow" any time
+  schedule:                 # uncomment to run from GitHub on a cadence
+  - cron: '0 * * * *'     # 06:00 UTC daily (~2am ET)
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      PROJECT_ID: craigslist-scraper-v2
+      REGION: us-central1
+      JOB_NAME: sklearn-daily
+    steps:
+      - uses: actions/checkout@v4
+      - name: Authenticate to Google Cloud
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: ${{ secrets.GCP_DEPLOYER_SA }}
+      - name: Setup gcloud
+        uses: google-github-actions/setup-gcloud@v2
+      - name: Execute job
+        run: gcloud run jobs execute "$JOB_NAME" --region "$REGION"
